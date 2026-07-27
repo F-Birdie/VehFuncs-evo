@@ -1,17 +1,3 @@
-/*
-    AngleOverride - extension for VehFuncs-style vehicle dummy conventions
-    Lets modelers override a door/boot/bonnet's opening angle by parenting
-    its dummy under a node named "f_ang_<signed integer degrees>".
-
-    Example hierarchy:
-        chassis
-        --f_ang_-90
-        ---boot_dummy
-        ----boot_ok
-        ----boot_dam
-
-    Built on https://github.com/DK22Pac/plugin-sdk
-*/
 #include "plugin.h"
 #include "CAutomobile.h"
 #include "NodeName.h"
@@ -23,12 +9,6 @@ using namespace plugin;
 
 namespace AngleOverride
 {
-    // Index order inferred from the commented-out lines in plugin-sdk's
-    // OpenDoorExample.cpp (BONNET, BOOT, DOOR_FRONT_LEFT, DOOR_FRONT_RIGHT,
-    // DOOR_REAR_LEFT, DOOR_REAR_RIGHT = 0..5). We deliberately do NOT
-    // redeclare eDoors here since the SDK already defines the real one
-    // (used by CAutomobile::FixDoor/SetDoorDamage) - redeclaring caused
-    // a type conflict. We just cast plain ints to the SDK's real eDoors.
     static bool CarNodeToDoorIndex(eCarNodes node, int& outDoorIndex)
     {
         switch (node)
@@ -63,28 +43,22 @@ namespace AngleOverride
         return true;
     }
 
-    // RwFrame has no parent pointer - only child (first child) and
-    // next (next sibling). To find a frame's parent we have to search
-    // down from the clump's root frame ourselves.
-    static RwFrame* FindParentFrame(RwFrame* searchRoot, RwFrame* target)
+    static void CollectParents(RwFrame* frame, std::unordered_map<RwFrame*, RwFrame*>& parentOf)
     {
-        if (!searchRoot) return nullptr;
+        if (!frame) return;
 
-        for (RwFrame* child = searchRoot->child; child; child = child->next)
+        for (RwFrame* child = frame->child; child; child = child->next)
         {
-            if (child == target) return searchRoot;
-
-            RwFrame* found = FindParentFrame(child, target);
-            if (found) return found;
+            parentOf[child] = frame;
+            CollectParents(child, parentOf);
         }
-        return nullptr;
     }
 
     static std::unordered_map<CVehicle*, bool> g_processedVehicles;
 
     static void ScanVehicle(CAutomobile* automobile)
     {
-        CVehicle* vehicle = reinterpret_cast<CVehicle*>(automobile);
+        CVehicle* vehicle = static_cast<CVehicle*>(automobile);
         if (g_processedVehicles[vehicle]) return;
 
         if (!vehicle->m_pRwClump)
@@ -95,6 +69,9 @@ namespace AngleOverride
 
         RwFrame* rootFrame = reinterpret_cast<RwFrame*>(vehicle->m_pRwClump->object.parent);
 
+        std::unordered_map<RwFrame*, RwFrame*> parentOf;
+        CollectParents(rootFrame, parentOf);
+
         for (int node = CAR_NODE_NONE; node < CAR_NUM_NODES; ++node)
         {
             RwFrame* dummyFrame = automobile->m_aCarNodes[node];
@@ -104,16 +81,13 @@ namespace AngleOverride
             if (!CarNodeToDoorIndex(static_cast<eCarNodes>(node), doorIndex))
                 continue;
 
-            RwFrame* parentFrame = FindParentFrame(rootFrame, dummyFrame);
+            auto it = parentOf.find(dummyFrame);
+            RwFrame* parentFrame = (it != parentOf.end()) ? it->second : nullptr;
 
             float radians;
             if (TryGetAngleOverrideRadians(parentFrame, radians))
             {
                 automobile->m_doors[doorIndex].m_fOpenAngle = radians;
-
-                // If the door swings the wrong direction instead of just
-                // the wrong amount, uncomment and test this too:
-                // automobile->m_doors[doorIndex].m_nDirn = (radians < 0.0f) ? -1 : 1;
             }
         }
 
@@ -134,7 +108,7 @@ public:
         Events::vehicleRenderEvent.before += [](CVehicle* vehicle)
             {
                 if (vehicle->m_nVehicleClass != VEHICLE_AUTOMOBILE) return;
-                AngleOverride::ScanVehicle(reinterpret_cast<CAutomobile*>(vehicle));
+                AngleOverride::ScanVehicle(static_cast<CAutomobile*>(vehicle));
             };
 
         Events::vehicleDtorEvent.before += [](CVehicle* vehicle)
