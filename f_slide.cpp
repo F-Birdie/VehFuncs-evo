@@ -1,43 +1,47 @@
 #include "plugin.h"
 #include "CAutomobile.h"
+#include "CHeli.h"
+#include "CPools.h"
 #include "NodeName.h"
+
 #include <unordered_map>
+#include <vector>
+#include <algorithm>
 #include <cstring>
 #include <cstdlib>
 #include <cmath>
-#include <algorithm>
 
 using namespace plugin;
 
 namespace SlideDoor
 {
-    // Same mapping as the verified-working AngleOverride.cpp - do not
-    // change this without re-testing, since door-index order does not
-    // match CAutomobile's constructor init order (confirmed by the
-    // RR/RF mixup).
     static bool CarNodeToDoorIndex(eCarNodes node, int& outDoorIndex)
     {
         switch (node)
         {
-        case CAR_BONNET:   outDoorIndex = 0; return true;
-        case CAR_BOOT:     outDoorIndex = 1; return true;
-        case CAR_DOOR_LF:  outDoorIndex = 2; return true;
-        case CAR_DOOR_RF:  outDoorIndex = 3; return true;
-        case CAR_DOOR_LR:  outDoorIndex = 4; return true;
-        case CAR_DOOR_RR:  outDoorIndex = 5; return true;
-        default:           return false;
+        case CAR_BONNET:  outDoorIndex = 0; return true;
+        case CAR_BOOT:    outDoorIndex = 1; return true;
+        case CAR_DOOR_LF: outDoorIndex = 2; return true;
+        case CAR_DOOR_RF: outDoorIndex = 3; return true;
+        case CAR_DOOR_LR: outDoorIndex = 4; return true;
+        case CAR_DOOR_RR: outDoorIndex = 5; return true;
+        default:          return false;
         }
     }
 
-    // Parses "f_sld_<x>,<y>,<z>" - signed decimals, 2 decimal places by
-    // convention (e.g. "f_sld_-0.06,-1.06,0.00").
+    static int MaxNodeForVehicle(bool isHeli)
+    {
+        return isHeli ? (HELI_DOOR_LR + 1) : CAR_NUM_NODES;
+    }
+
+    // Parses "f_sld_<x>,<y>,<z>"
     static bool TryGetSlideOverride(const char* parentName, CVector& outOffset)
     {
         const char* prefix = "f_sld_";
-        const size_t prefixLen = 6;
-        if (strncmp(parentName, prefix, prefixLen) != 0) return false;
+        if (strncmp(parentName, prefix, 6) != 0)
+            return false;
 
-        const char* cursor = parentName + prefixLen;
+        const char* cursor = parentName + 6;
         char* end = nullptr;
 
         float x = strtof(cursor, &end);
@@ -70,34 +74,59 @@ namespace SlideDoor
         bool    hasOverride[6] = {};
         CVector slideOffset[6] = {};
         CVector closedPosition[6] = {};
-        // Largest of |x|,|y|,|z| in slideOffset[i]. Used as the shared
-        // "distance travelled" rate so every axis moves at the same
-        // speed - the axis with the smallest offset just reaches its
-        // target early and holds, rather than crawling the whole swing.
         float   maxAxisMag[6] = {};
         bool    scanned = false;
     };
 
     static std::unordered_map<CVehicle*, SlideData> g_slideData;
+    static std::vector<CVehicle*> g_activeHelis;
+
+    static bool IsHelicopter(CVehicle* vehicle)
+    {
+        if (!vehicle) return false;
+
+        if (vehicle->m_nVehicleClass == VEHICLE_HELI)
+            return true;
+
+        // Correct list of all helicopter models
+        switch (vehicle->m_nModelIndex)
+        {
+        case 417: // leviathn
+        case 425: // hunter
+        case 447: // seaspar
+        case 465: // rcraider
+        case 469: // sparrow
+        case 487: // maverick
+        case 488: // vcnmav
+        case 497: // polmav
+        case 501: // rcgoblin
+        case 548: // cargobob
+        case 563: // raindanc
+            return true;
+        default:
+            return false;
+        }
+    }
 
     static void ScanVehicle(CAutomobile* automobile)
     {
         CVehicle* vehicle = static_cast<CVehicle*>(automobile);
         SlideData& data = g_slideData[vehicle];
 
-        if (data.scanned) return;
+        if (data.scanned)
+            return;
 
         if (!vehicle->m_pRwClump)
-        {
-            data.scanned = true;
-            return;
-        }
+            return; // try again next frame
+
+        bool isHeli = IsHelicopter(vehicle);
+        int maxNode = MaxNodeForVehicle(isHeli);
 
         RwFrame* rootFrame = reinterpret_cast<RwFrame*>(vehicle->m_pRwClump->object.parent);
         std::unordered_map<RwFrame*, RwFrame*> parentOf;
         CollectParents(rootFrame, parentOf);
 
-        for (int node = CAR_NODE_NONE; node < CAR_NUM_NODES; ++node)
+        for (int node = CAR_NODE_NONE; node < maxNode; ++node)
         {
             RwFrame* dummyFrame = automobile->m_aCarNodes[node];
             if (!dummyFrame) continue;
@@ -107,14 +136,14 @@ namespace SlideDoor
                 continue;
 
             auto it = parentOf.find(dummyFrame);
-            RwFrame* parentFrame = (it != parentOf.end()) ? it->second : nullptr;
-            if (!parentFrame) continue;
+            if (it == parentOf.end()) continue;
 
-            char* parentName = GetFrameNodeName(parentFrame);
+            char* parentName = GetFrameNodeName(it->second);
             if (!parentName) continue;
 
             CVector offset;
-            if (!TryGetSlideOverride(parentName, offset)) continue;
+            if (!TryGetSlideOverride(parentName, offset))
+                continue;
 
             data.hasOverride[doorIndex] = true;
             data.slideOffset[doorIndex] = offset;
@@ -127,8 +156,6 @@ namespace SlideDoor
         data.scanned = true;
     }
 
-    // Moves a single axis toward its target offset at the shared
-    // "traveled" rate, clamping once it reaches its own total distance.
     static float ApplyAxisSlide(float closed, float offset, float traveled)
     {
         if (offset == 0.0f) return closed;
@@ -141,30 +168,32 @@ namespace SlideDoor
 
     static void ApplySlideOverrides(CAutomobile* automobile, SlideData& data)
     {
-        for (int node = CAR_NODE_NONE; node < CAR_NUM_NODES; ++node)
+        bool isHeli = IsHelicopter(automobile);
+        int maxNode = MaxNodeForVehicle(isHeli);
+
+        for (int node = CAR_NODE_NONE; node < maxNode; ++node)
         {
             int doorIndex;
             if (!CarNodeToDoorIndex(static_cast<eCarNodes>(node), doorIndex))
                 continue;
-
             if (!data.hasOverride[doorIndex]) continue;
 
             RwFrame* frame = automobile->m_aCarNodes[node];
             if (!frame) continue;
 
             float ratio = automobile->m_doors[doorIndex].GetAngleOpenRatio();
+            float traveled = ratio * data.maxAxisMag[doorIndex];
 
             const CVector& offset = data.slideOffset[doorIndex];
             const CVector& closed = data.closedPosition[doorIndex];
-            float traveled = ratio * data.maxAxisMag[doorIndex];
 
             CVector newPos(
                 ApplyAxisSlide(closed.x, offset.x, traveled),
                 ApplyAxisSlide(closed.y, offset.y, traveled),
                 ApplyAxisSlide(closed.z, offset.z, traveled)
             );
-            RwV3d rwPos{ newPos.x, newPos.y, newPos.z };
 
+            RwV3d rwPos{ newPos.x, newPos.y, newPos.z };
             RwMatrix* rwMat = RwFrameGetMatrix(frame);
             RwMatrixSetIdentity(rwMat);
             RwMatrixTranslate(rwMat, &rwPos, rwCOMBINEREPLACE);
@@ -172,23 +201,34 @@ namespace SlideDoor
         }
     }
 
-    static std::unordered_map<CVehicle*, bool> g_needsRescan;
-
     void Update(CAutomobile* automobile)
     {
         CVehicle* vehicle = static_cast<CVehicle*>(automobile);
         ScanVehicle(automobile);
-        ApplySlideOverrides(automobile, g_slideData[vehicle]);
+
+        auto it = g_slideData.find(vehicle);
+        if (it != g_slideData.end() && it->second.scanned)
+            ApplySlideOverrides(automobile, it->second);
     }
 
     void OnVehicleModelChanged(CVehicle* vehicle)
     {
-        g_slideData[vehicle] = SlideData{}; // force rescan
+        g_slideData[vehicle] = SlideData{};
+
+        if (IsHelicopter(vehicle))
+        {
+            if (std::find(g_activeHelis.begin(), g_activeHelis.end(), vehicle) == g_activeHelis.end())
+                g_activeHelis.push_back(vehicle);
+        }
     }
 
     void OnVehicleDestroyed(CVehicle* vehicle)
     {
         g_slideData.erase(vehicle);
+
+        auto it = std::find(g_activeHelis.begin(), g_activeHelis.end(), vehicle);
+        if (it != g_activeHelis.end())
+            g_activeHelis.erase(it);
     }
 }
 
@@ -197,15 +237,29 @@ class SlideDoorPlugin
 public:
     SlideDoorPlugin()
     {
-        Events::vehicleSetModelEvent += [](CVehicle* vehicle, int modelId)
+        Events::vehicleSetModelEvent += [](CVehicle* vehicle, int)
             {
                 SlideDoor::OnVehicleModelChanged(vehicle);
             };
 
+        // Cars / normal automobiles
         Events::vehicleRenderEvent.before += [](CVehicle* vehicle)
             {
-                if (vehicle->m_nVehicleClass != VEHICLE_AUTOMOBILE) return;
+                if (vehicle->m_nVehicleClass != VEHICLE_AUTOMOBILE &&
+                    vehicle->m_nVehicleClass != VEHICLE_HELI)
+                    return;
+
                 SlideDoor::Update(static_cast<CAutomobile*>(vehicle));
+            };
+
+        // Helicopters only (tiny list, no full pool walk)
+        Events::processScriptsEvent += []
+            {
+                for (CVehicle* vehicle : SlideDoor::g_activeHelis)
+                {
+                    if (vehicle)
+                        SlideDoor::Update(static_cast<CAutomobile*>(vehicle));
+                }
             };
 
         Events::vehicleDtorEvent.before += [](CVehicle* vehicle)
