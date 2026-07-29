@@ -1,7 +1,6 @@
 #include "plugin.h"
 #include "CAutomobile.h"
 #include "CHeli.h"
-#include "CPools.h"
 #include "NodeName.h"
 
 #include <unordered_map>
@@ -69,13 +68,87 @@ namespace SlideDoor
         }
     }
 
+    // How fast the smaller axes move during their own stage, as a
+    // fraction of the lead (largest-offset) axis's speed. 1.0 = all
+    // axes share time proportional to their distance, i.e. equal speed.
+    // Lower values make the small axes noticeably slower/lazier relative
+    // to the big slide. This is the one dial to tune.
+    static constexpr float kSmallAxisSpeedRatio = 0.4f;
+
+    // Splits the door's 0..1 open ratio into consecutive, non-overlapping
+    // stages - smallest offset moves first, largest (the "lead" axis)
+    // moves last. Stage widths are solved so the small axes move at
+    // kSmallAxisSpeedRatio times the lead axis's speed, while the whole
+    // set of stages still always sums to exactly 1 - no clamping needed,
+    // the formula can't produce a total over 1 for any ratio > 0.
+    struct AxisSlices
+    {
+        float sliceStart[3] = { 0.0f, 0.0f, 0.0f };
+        float sliceEnd[3] = { 0.0f, 0.0f, 0.0f };
+    };
+
+    static AxisSlices ComputeAxisSlices(const CVector& offset, float smallAxisSpeedRatio)
+    {
+        AxisSlices result;
+
+        struct AxisEntry { int idx; float mag; };
+        std::vector<AxisEntry> active;
+
+        if (offset.x != 0.0f) active.push_back({ 0, std::fabs(offset.x) });
+        if (offset.y != 0.0f) active.push_back({ 1, std::fabs(offset.y) });
+        if (offset.z != 0.0f) active.push_back({ 2, std::fabs(offset.z) });
+
+        if (active.empty()) return result;
+
+        std::sort(active.begin(), active.end(),
+            [](const AxisEntry& a, const AxisEntry& b) { return a.mag < b.mag; });
+
+        int n = static_cast<int>(active.size());
+
+        // Only one axis in use - it just gets the whole range, no "small
+        // axis" concept applies.
+        if (n == 1)
+        {
+            result.sliceStart[active[0].idx] = 0.0f;
+            result.sliceEnd[active[0].idx] = 1.0f;
+            return result;
+        }
+
+        float r = std::max(smallAxisSpeedRatio, 0.001f); // guard divide-by-zero
+        float leadMag = active[n - 1].mag;
+
+        float sumSmallMag = 0.0f;
+        for (int i = 0; i < n - 1; ++i)
+            sumSmallMag += active[i].mag;
+
+        // Solved so lead-axis speed and small-axis speed = r * lead-speed
+        // both come out consistent with all stages summing to 1.
+        float leadSpeedUnit = leadMag + sumSmallMag / r;
+
+        float cursor = 0.0f;
+        for (int i = 0; i < n - 1; ++i)
+        {
+            float duration = active[i].mag / (r * leadSpeedUnit);
+            result.sliceStart[active[i].idx] = cursor;
+            result.sliceEnd[active[i].idx] = cursor + duration;
+            cursor += duration;
+        }
+
+        // Lead axis takes the remainder, forced to end exactly at 1.0 to
+        // avoid float drift leaving a tiny gap at full-open.
+        result.sliceStart[active[n - 1].idx] = cursor;
+        result.sliceEnd[active[n - 1].idx] = 1.0f;
+
+        return result;
+    }
+
     struct SlideData
     {
-        bool    hasOverride[6] = {};
-        CVector slideOffset[6] = {};
-        CVector closedPosition[6] = {};
-        float   maxAxisMag[6] = {};
-        bool    scanned = false;
+        bool       hasOverride[6] = {};
+        CVector    slideOffset[6] = {};
+        CVector    closedPosition[6] = {};
+        AxisSlices slices[6] = {};
+        bool       scanned = false;
     };
 
     static std::unordered_map<CVehicle*, SlideData> g_slideData;
@@ -94,12 +167,12 @@ namespace SlideDoor
         case 417: // leviathn
         case 425: // hunter
         case 447: // seaspar
-        case 465: // rcraider
+      //  case 465: // rcraider
         case 469: // sparrow
         case 487: // maverick
         case 488: // vcnmav
         case 497: // polmav
-        case 501: // rcgoblin
+      //  case 501: // rcgoblin
         case 548: // cargobob
         case 563: // raindanc
             return true;
@@ -108,18 +181,22 @@ namespace SlideDoor
         }
     }
 
-    static void ScanVehicle(CAutomobile* automobile)
+    // isHeli is now computed once by the caller (Update) and threaded
+    // through, instead of ScanVehicle and ApplySlideOverrides each
+    // re-running the same IsHelicopter() switch every frame.
+    static void ScanVehicle(CAutomobile* automobile, SlideData& data, bool isHeli)
     {
         CVehicle* vehicle = static_cast<CVehicle*>(automobile);
-        SlideData& data = g_slideData[vehicle];
 
         if (data.scanned)
             return;
 
         if (!vehicle->m_pRwClump)
-            return; // try again next frame
+        {
+            data.scanned = true; // nothing to scan, don't retry every frame
+            return;
+        }
 
-        bool isHeli = IsHelicopter(vehicle);
         int maxNode = MaxNodeForVehicle(isHeli);
 
         RwFrame* rootFrame = reinterpret_cast<RwFrame*>(vehicle->m_pRwClump->object.parent);
@@ -147,7 +224,7 @@ namespace SlideDoor
 
             data.hasOverride[doorIndex] = true;
             data.slideOffset[doorIndex] = offset;
-            data.maxAxisMag[doorIndex] = std::max({ std::fabs(offset.x), std::fabs(offset.y), std::fabs(offset.z) });
+            data.slices[doorIndex] = ComputeAxisSlices(offset, kSmallAxisSpeedRatio);
 
             RwV3d* pos = RwMatrixGetPos(RwFrameGetMatrix(dummyFrame));
             data.closedPosition[doorIndex] = CVector(pos->x, pos->y, pos->z);
@@ -156,19 +233,20 @@ namespace SlideDoor
         data.scanned = true;
     }
 
-    static float ApplyAxisSlide(float closed, float offset, float traveled)
+    static float ApplyAxisSlide(float closed, float offset, float ratio, float sliceStart, float sliceEnd)
     {
         if (offset == 0.0f) return closed;
 
-        float mag = std::fabs(offset);
-        float sign = (offset > 0.0f) ? 1.0f : -1.0f;
-        float dist = std::min(traveled, mag) * sign;
-        return closed + dist;
+        float t;
+        if (ratio <= sliceStart)      t = 0.0f;
+        else if (ratio >= sliceEnd)   t = 1.0f;
+        else                          t = (ratio - sliceStart) / (sliceEnd - sliceStart);
+
+        return closed + offset * t;
     }
 
-    static void ApplySlideOverrides(CAutomobile* automobile, SlideData& data)
+    static void ApplySlideOverrides(CAutomobile* automobile, SlideData& data, bool isHeli)
     {
-        bool isHeli = IsHelicopter(automobile);
         int maxNode = MaxNodeForVehicle(isHeli);
 
         for (int node = CAR_NODE_NONE; node < maxNode; ++node)
@@ -182,15 +260,15 @@ namespace SlideDoor
             if (!frame) continue;
 
             float ratio = automobile->m_doors[doorIndex].GetAngleOpenRatio();
-            float traveled = ratio * data.maxAxisMag[doorIndex];
 
             const CVector& offset = data.slideOffset[doorIndex];
             const CVector& closed = data.closedPosition[doorIndex];
+            const AxisSlices& slices = data.slices[doorIndex];
 
             CVector newPos(
-                ApplyAxisSlide(closed.x, offset.x, traveled),
-                ApplyAxisSlide(closed.y, offset.y, traveled),
-                ApplyAxisSlide(closed.z, offset.z, traveled)
+                ApplyAxisSlide(closed.x, offset.x, ratio, slices.sliceStart[0], slices.sliceEnd[0]),
+                ApplyAxisSlide(closed.y, offset.y, ratio, slices.sliceStart[1], slices.sliceEnd[1]),
+                ApplyAxisSlide(closed.z, offset.z, ratio, slices.sliceStart[2], slices.sliceEnd[2])
             );
 
             RwV3d rwPos{ newPos.x, newPos.y, newPos.z };
@@ -204,11 +282,16 @@ namespace SlideDoor
     void Update(CAutomobile* automobile)
     {
         CVehicle* vehicle = static_cast<CVehicle*>(automobile);
-        ScanVehicle(automobile);
+        bool isHeli = IsHelicopter(vehicle);
 
-        auto it = g_slideData.find(vehicle);
-        if (it != g_slideData.end() && it->second.scanned)
-            ApplySlideOverrides(automobile, it->second);
+        // Single lookup, reused for both the scan and the apply step,
+        // instead of looking the vehicle up in the map twice.
+        SlideData& data = g_slideData[vehicle];
+
+        ScanVehicle(automobile, data, isHeli);
+
+        if (data.scanned)
+            ApplySlideOverrides(automobile, data, isHeli);
     }
 
     void OnVehicleModelChanged(CVehicle* vehicle)
