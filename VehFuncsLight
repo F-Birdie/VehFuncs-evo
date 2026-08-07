@@ -1,0 +1,792 @@
+/*
+ * VehFuncs Light — f_class + f_extras only
+ * Logic taken from Junior_Djjr VehFuncs (RecursiveExtras / collapse / destroy)
+ * https://github.com/JuniorDjjr/VehFuncs
+ */
+#include "plugin.h"
+#include "CVisibilityPlugins.h"
+#include "assembly.hpp"
+#include <string>
+#include <list>
+#include <vector>
+#include <cstring>
+#include <cstdlib>
+#include <fstream>
+
+using namespace plugin;
+using namespace std;
+using namespace injector;
+
+static fstream lg;
+static bool useLog = true;
+static uintptr_t AtomicAlphaCallBack = 0;
+
+
+// ============================================================
+// Junior FramePlugin (VehFuncsCommon.h) — required by FRAME_EXTENSION
+// ============================================================
+
+static unsigned int FramePluginOffset = 0;
+#define PLUGIN_ID_STR 'VEHF'
+#define FRAME_EXTENSION(frame) ((FramePlugin*)((unsigned int)(frame) + FramePluginOffset))
+
+struct FramePlugin
+{
+    void* origMatrix;
+    CVehicle* owner;
+    int8_t LODdist;
+    struct {
+        unsigned char bNeverRender : 1;
+        unsigned char bIsVarWheel : 1;
+        unsigned char bDestroyOnRemoveUpgrade : 1;
+    } flags;
+
+    static RwFrame* Init(RwFrame* frame)
+    {
+        FRAME_EXTENSION(frame)->owner = nullptr;
+        FRAME_EXTENSION(frame)->origMatrix = nullptr;
+        FRAME_EXTENSION(frame)->flags.bNeverRender = false;
+        FRAME_EXTENSION(frame)->flags.bIsVarWheel = false;
+        FRAME_EXTENSION(frame)->flags.bDestroyOnRemoveUpgrade = false;
+        FRAME_EXTENSION(frame)->LODdist = -100;
+        return frame;
+    }
+    static RwFrame* Destroy(RwFrame* frame)
+    {
+        return frame;
+    }
+    static RwFrame* Copy(RwFrame* copy, RwFrame*)
+    {
+        return copy;
+    }
+};
+
+// ============================================================
+// Junior Patches::FindDamage — exact
+// ============================================================
+
+namespace FindDamage
+{
+    static RwFrame* __cdecl CustomFindDamageAtomicsCB(RwFrame* frame, void* data)
+    {
+        RwFrameForAllObjects(frame, (RwObjectCallBack)0x4C7BD0, data);
+        if (*(uint32_t*)data > 0 && *((uint32_t*)data + 1) > 0)
+            return frame;
+        RwFrameForAllChildren(frame, CustomFindDamageAtomicsCB, data);
+        return frame;
+    }
+
+    static RwFrame* __cdecl CustomFindDamageAtomics(RwFrame* frame, RwFrame* (__cdecl* callback)(RwFrame*, void*), void* data)
+    {
+        if (!callback(frame, data))
+            return frame;
+        RwFrame* child = frame->child;
+        if (child)
+        {
+            do
+            {
+                RwFrame* next = child->next;
+                if (!callback(child, data))
+                    break;
+                child = next;
+            } while (child);
+        }
+        return frame;
+    }
+}
+
+// Junior CheckCrashFillFrameArrayCB — exact
+static int __cdecl CheckCrashFillFrameArrayCB(RwFrame* frame)
+{
+    int id = CVisibilityPlugins::GetFrameHierarchyId(frame);
+    if (id >= 25)
+    {
+        CVisibilityPlugins::SetFrameHierarchyId(frame, 0);
+        return 0;
+    }
+    return id;
+}
+
+
+// ============================================================
+// Helpers
+// ============================================================
+
+static char* GetFrameNodeName(RwFrame* frame)
+{
+    return ((char* (__cdecl*)(RwFrame*))0x72FB30)(frame);
+}
+
+static int Random(int min, int max)
+{
+    if (min >= max) return min;
+    return min + (rand() % (max - min + 1));
+}
+
+// ============================================================
+// Junior DestroyNodeHierarchyRecursive (Utilities.cpp) — exact
+// ============================================================
+
+static void DestroyNodeHierarchyRecursive(RwFrame* frame)
+{
+    RpAtomic* atomic = (RpAtomic*)GetFirstObject(frame);
+    if (atomic != nullptr)
+    {
+        RpClump* clump = atomic->clump;
+        RpClumpRemoveAtomic(clump, atomic);
+        RpAtomicDestroy(atomic);
+    }
+
+    RwFrameDestroy(frame);
+
+    if (RwFrame* newFrame = frame->child) DestroyNodeHierarchyRecursive(newFrame);
+    if (RwFrame* newFrame = frame->next)  DestroyNodeHierarchyRecursive(newFrame);
+}
+
+// ============================================================
+// Per-vehicle data
+// ============================================================
+
+class ExtendedData
+{
+public:
+    bool nodesProcess;
+    int randomSeed;
+    int randomSeedUsage;
+    RwFrame* classFrame;
+
+    ExtendedData(CVehicle*)
+    {
+        nodesProcess = true;
+        randomSeed = rand();
+        randomSeedUsage = 0;
+        classFrame = nullptr;
+    }
+};
+
+static VehicleExtendedData<ExtendedData> xData;
+
+static list<string>& getClassList()
+{
+    static list<string> classList;
+    return classList;
+}
+
+// ============================================================
+// Junior CustomCollapseFramesCB / CustomMoveObjectsCB — exact
+// ============================================================
+
+static RpAtomic* __cdecl CustomMoveObjectsCB(RpAtomic* atomic, RwFrame* frame);
+
+static RwFrame* __cdecl CustomCollapseFramesCB(RwFrame* frame, void* data)
+{
+    RwFrameForAllChildren(frame, (RwFrameCallBack)CustomCollapseFramesCB, data);
+    RwFrameForAllObjects(frame, (RwObjectCallBack)CustomMoveObjectsCB, data);
+    return frame;
+}
+
+static RpAtomic* __cdecl CustomMoveObjectsCB(RpAtomic* atomic, RwFrame* frame)
+{
+    RwFrame* frameAtomic = GetObjectParent((RwObject*)atomic);
+    RwFrame* frameAtomicParent = RwFrameGetParent(frameAtomic);
+
+    int frameId = CVisibilityPlugins::GetFrameHierarchyId(frameAtomicParent);
+
+    // If parent is dummy, always collapse
+    if (frameId > 0)
+    {
+        const string frameAtomicName = GetFrameNodeName(frameAtomic);
+        if (frameAtomicName[0] == 'e')
+        {
+            if (frameAtomicName[1] == 'x' && frameAtomicName[2] == 't' && frameAtomicName[3] == 'r' && frameAtomicName[4] == 'a')
+                return atomic;
+        }
+        else
+        {
+            if (frameAtomicName[0] == 'f' && frameAtomicName[1] == '_')
+                return atomic;
+        }
+        RpAtomicSetFrame(atomic, frame);
+        return atomic;
+    }
+
+    // If parent isn't dummy, collapse if is alpha and damageable
+    if ((uint32_t)atomic->renderCallBack == AtomicAlphaCallBack)
+    {
+        RwFrame* parent = RwFrameGetParent(frameAtomic);
+
+        while (parent != frame)
+        {
+            const string parentName = GetFrameNodeName(parent);
+            if (parentName[0] == 'f')
+            {
+                if (parentName[1] == '_')
+                    return atomic;
+            }
+            parent = RwFrameGetParent(parent);
+            if (!parent) break;
+        }
+
+        const string frameAtomicName = GetFrameNodeName(frameAtomic);
+        int len = (int)frameAtomicName.length();
+
+        if (len >= 4)
+        {
+            if (frameAtomicName[0] == 'e')
+            {
+                if (frameAtomicName[1] == 'x' && frameAtomicName[2] == 't' && frameAtomicName[3] == 'r' && frameAtomicName[4] == 'a')
+                    return atomic;
+            }
+            else
+            {
+                if (frameAtomicName[0] == 'f' && frameAtomicName[1] == '_')
+                    return atomic;
+            }
+
+            if (frameAtomicName[(len - 3)] == '_'
+                && frameAtomicName[(len - 2)] == 'o'
+                && frameAtomicName[(len - 1)] == 'k')
+            {
+                RpAtomicSetFrame(atomic, frame);
+                return atomic;
+            }
+
+            if (frameAtomicName[(len - 4)] == '_'
+                && frameAtomicName[(len - 3)] == 'd'
+                && frameAtomicName[(len - 2)] == 'a'
+                && frameAtomicName[(len - 1)] == 'm')
+            {
+                RpAtomicSetFrame(atomic, frame);
+                return atomic;
+            }
+        }
+    }
+
+    return atomic;
+}
+
+// ============================================================
+// Junior FrameIsOtherClass / RemoveFrameClassFromNormalArray — exact
+// ============================================================
+
+static void RemoveFrameClassFromNormalArray(RwFrame* frameClass, RwFrame* frameArray[])
+{
+    for (int i = 0; i < 32; i++)
+    {
+        if (frameArray[i] == frameClass)
+        {
+            frameArray[i] = nullptr;
+            return;
+        }
+    }
+}
+
+static bool FrameIsOtherClass(RwFrame* frame)
+{
+    string name = GetFrameNodeName(frame);
+    name = name.substr(0, 24);
+    size_t found = name.find("[");
+    if (found != string::npos)
+    {
+        list<string>& classList = getClassList();
+        if (classList.size() > 0)
+        {
+            for (list<string>::iterator it = classList.begin(); it != classList.end(); ++it)
+            {
+                size_t foundclass = name.find(*it);
+                if (foundclass != string::npos)
+                    return false;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+// ============================================================
+// Junior ProcessClassesRecursive — without '?' conditions
+// ============================================================
+
+static void ProcessClassesRecursive(RwFrame* frame, CVehicle* vehicle, bool bSubclass)
+{
+    ExtendedData& xdata = xData.Get(vehicle);
+
+    string name = GetFrameNodeName(frame);
+    name = name.substr(0, 24);
+
+    vector<RwFrame*> classNodes;
+    vector<int> classNodesPercent;
+
+    if (name.find("_reset") != string::npos)
+        getClassList().clear();
+
+    RwFrame* tempNode = frame->child;
+    if (!tempNode) return;
+
+    if (!bSubclass)
+    {
+        srand(xdata.randomSeed + xdata.randomSeedUsage);
+        xdata.randomSeedUsage++;
+    }
+
+    int selectVariations = 1;
+    bool randomizeVariations = false;
+
+    size_t found = name.find(":");
+    if (found != string::npos && name.length() > found)
+    {
+        selectVariations = stoi(&name[found + 1]);
+        if (found + 2 < name.length() && name[found + 2] == '+')
+            randomizeVariations = true;
+    }
+
+    int totalClass = 0;
+    while (tempNode)
+    {
+        string tempNodeName = GetFrameNodeName(tempNode);
+        tempNodeName = tempNodeName.substr(0, 24);
+
+        // skip characteristics / conditions (not used in Light)
+        if (!tempNodeName.empty() && tempNodeName[0] == '!')
+        {
+            tempNode = tempNode->next;
+            continue;
+        }
+        if (tempNodeName.find('?') != string::npos)
+        {
+            tempNode = tempNode->next;
+            continue;
+        }
+
+        size_t foundDigit = tempNodeName.find("[");
+        if (foundDigit != string::npos)
+            classNodesPercent.push_back(stoi(&tempNodeName[foundDigit + 1]));
+        else
+            classNodesPercent.push_back(100);
+
+        classNodes.push_back(tempNode);
+        totalClass++;
+        tempNode = tempNode->next;
+    }
+
+    if (totalClass <= 0) return;
+
+    if (randomizeVariations)
+        selectVariations = Random(selectVariations, totalClass);
+    else if (selectVariations > totalClass)
+        selectVariations = totalClass;
+
+    if (useLog)
+        lg << "ProcessClasses: " << totalClass << " under '" << name
+        << "' select=" << selectVariations << "\n";
+
+    int i = 0;
+    while (i < selectVariations)
+    {
+        int random = Random(0, totalClass - 1);
+        if (!classNodes[random]) continue;
+
+        if (classNodesPercent[random] != 100)
+        {
+            if (Random(1, 100) > classNodesPercent[random])
+                continue;
+        }
+
+        if (useLog)
+            lg << "ProcessClasses: SELECTED '" << GetFrameNodeName(classNodes[random]) << "'\n";
+
+        if (classNodes[random]->child)
+            ProcessClassesRecursive(classNodes[random], vehicle, true);
+
+        // Junior class name strip
+        string className = GetFrameNodeName(classNodes[random]);
+        className = className.substr(0, 24);
+
+        size_t found1 = className.find_first_of("_");
+        size_t found2 = className.find_first_of("[");
+        size_t found3 = className.find_first_of(":");
+        if (found1 != string::npos || found2 != string::npos || found3 != string::npos)
+        {
+            size_t cutPos = string::npos;
+            if (found1 != string::npos) cutPos = found1;
+            if (found2 != string::npos && (cutPos == string::npos || found2 < cutPos)) cutPos = found2;
+            if (found3 != string::npos && (cutPos == string::npos || found3 < cutPos)) cutPos = found3;
+            if (cutPos != string::npos)
+            {
+                string classNameFixed = className.substr(0, cutPos);
+                if (classNameFixed.length() > 0)
+                {
+                    getClassList().push_back(classNameFixed);
+                    if (useLog)
+                        lg << "ProcessClasses: classList += '" << classNameFixed << "'\n";
+                }
+            }
+        }
+        else
+        {
+            getClassList().push_back(className);
+            if (useLog)
+                lg << "ProcessClasses: classList += '" << className << "'\n";
+        }
+
+        classNodes[random] = nullptr;
+        i++;
+    }
+}
+
+// ============================================================
+// Junior ProcessExtraRecursive — exact
+// ============================================================
+
+static void ProcessExtraRecursive(RwFrame* frame, CVehicle* vehicle)
+{
+    string name = GetFrameNodeName(frame);
+    name = name.substr(0, 24);
+    if (useLog) lg << "Extras: Processing node: '" << name << "'\n";
+
+    RwFrame* tempFrame = frame->child;
+    if (tempFrame != nullptr)
+    {
+        int selectVariations = -1;
+        bool randomizeVariations = false;
+
+        size_t found = name.find(":");
+        if (found != string::npos)
+        {
+            if (name.length() > found)
+            {
+                selectVariations = stoi(&name[found + 1]);
+                int i = 0;
+                do {
+                    if (name.length() > (found + 1 + i))
+                    {
+                        if (name[found + 2 + i] == '+')
+                            randomizeVariations = true;
+                    }
+                    i++;
+                } while (i <= 1);
+            }
+        }
+
+        int frames = 0;
+        int classFrames = 0;
+        RwFrame* extraFrames[33];
+        RwFrame* extraFramesMatchClass[33];
+        memset(extraFrames, 0, sizeof(extraFrames));
+        memset(extraFramesMatchClass, 0, sizeof(extraFramesMatchClass));
+
+        while (frames < 32)
+        {
+            if (tempFrame != nullptr)
+            {
+                list<string>& classList = getClassList();
+                if (classList.size() > 0)
+                {
+                    string tempFrameName = GetFrameNodeName(tempFrame);
+                    tempFrameName = tempFrameName.substr(0, 24);
+                    int startStringSearchIndex = 0;
+                    int tempFrameNameLength = (int)tempFrameName.length();
+                    do {
+                        size_t foundOpen = tempFrameName.find_first_of("[", startStringSearchIndex + 1);
+                        if (foundOpen != string::npos)
+                        {
+                            size_t foundClose = tempFrameName.find_first_of("]", foundOpen + 1);
+                            if (foundClose != string::npos)
+                            {
+                                string frameClass = tempFrameName.substr(foundOpen + 1, foundClose - (foundOpen + 1));
+                                for (list<string>::iterator it = classList.begin(); it != classList.end(); ++it)
+                                {
+                                    string className = (string)*it;
+                                    if (frameClass.length() == className.length() && strcmp(&frameClass[0], &className[0]) == 0)
+                                    {
+                                        extraFramesMatchClass[classFrames] = tempFrame;
+                                        if (useLog) lg << "Extras: Added to match class: " << tempFrameName << "\n";
+                                        classFrames++;
+                                        break;
+                                    }
+                                }
+                                startStringSearchIndex = (int)foundClose;
+                            }
+                            else break;
+                        }
+                        else break;
+                    } while ((tempFrameNameLength - 2) > startStringSearchIndex);
+                }
+                extraFrames[frames] = tempFrame;
+                frames++;
+            }
+            else break;
+            tempFrame = tempFrame->next;
+        }
+
+        if (randomizeVariations == true)
+            selectVariations = Random(selectVariations, frames);
+        else
+            if (selectVariations > frames) selectVariations = frames;
+
+        extraFrames[(frames + 1)] = (RwFrame*)1;
+        extraFramesMatchClass[(classFrames + 1)] = (RwFrame*)1;
+
+        if (useLog) lg << "Extras: Childs found: " << frames << "\n";
+        if (classFrames > 0)
+            if (useLog) lg << "Extras: Class childs found: " << classFrames << "\n";
+
+        if (selectVariations == -1)
+        {
+            if (frames == 1) selectVariations = 0;
+            else selectVariations = 1;
+        }
+        if (useLog) lg << "Extras: Select variations: " << selectVariations << "\n";
+
+        int i = 0;
+        int random = 0;
+        int loopClassFrames = classFrames;
+        do {
+            if (selectVariations == 0)
+            {
+                if (Random(0, frames) == 0) break;
+            }
+            if (loopClassFrames > 0)
+            {
+                random = Random(0, classFrames - 1);
+                if (extraFramesMatchClass[random] != nullptr)
+                {
+                    i++;
+                    if (useLog) lg << "Extras: Starting new node (class match) " << i << " of " << selectVariations << " \n";
+                    ProcessExtraRecursive(extraFramesMatchClass[random], vehicle);
+
+                    RemoveFrameClassFromNormalArray(extraFramesMatchClass[random], extraFrames);
+                    extraFramesMatchClass[random] = nullptr;
+
+                    loopClassFrames--;
+                }
+            }
+            else
+            {
+                if (frames > 1) random = Random(0, frames - 1);
+                if (extraFrames[random] != nullptr)
+                {
+                    if (FrameIsOtherClass(extraFrames[random]))
+                    {
+                        DestroyNodeHierarchyRecursive(extraFrames[random]);
+                        extraFrames[random] = nullptr;
+                        continue;
+                    }
+                    i++;
+                    if (useLog) lg << "Extras: Starting new node " << i << " of " << selectVariations << " \n";
+                    ProcessExtraRecursive(extraFrames[random], vehicle);
+
+                    extraFrames[random] = nullptr;
+                }
+                else
+                {
+                    int k = 0;
+                    for (k = 0; k < frames; k++)
+                    {
+                        if (extraFrames[k] != nullptr) break;
+                    }
+                    if (k == frames)
+                    {
+                        if (useLog) lg << "Extras: There is no more extras to select \n";
+                        break;
+                    }
+                }
+            }
+        } while (i < selectVariations);
+
+        // Delete all not selected nodes — Junior exact
+        for (int j = 0; j < 33; j++)
+        {
+            if (extraFrames[j] == (RwFrame*)1) break;
+            if (extraFrames[j] != nullptr && extraFrames[j] != 0)
+                DestroyNodeHierarchyRecursive(extraFrames[j]);
+        }
+    }
+    else if (useLog) lg << "Extras: Node has no child \n";
+}
+
+// ============================================================
+// FindNodes — Junior-style walk
+// ============================================================
+
+static void FindNodesRecursive(RwFrame* frame, CVehicle* vehicle)
+{
+    while (frame)
+    {
+        const string name = string(GetFrameNodeName(frame)).substr(0, 24);
+        ExtendedData& xdata = xData.Get(vehicle);
+
+        if (name.length() >= 2 && name[0] == 'f' && name[1] == '_')
+        {
+            if (xdata.randomSeed != 0)
+            {
+                if (name.find("f_class") != string::npos)
+                {
+                    if (useLog) lg << "FindNodes: f_class '" << name << "'\n";
+                    ProcessClassesRecursive(frame, vehicle, false);
+                    if (RwFrame* tempFrame = frame->next)
+                    {
+                        frame = tempFrame;
+                        continue;
+                    }
+                    break;
+                }
+
+                if (name.find("f_extras") != string::npos)
+                {
+                    if (useLog) lg << "FindNodes: f_extras '" << name << "'\n";
+                    if (frame->child)
+                    {
+                        srand(xdata.randomSeed + xdata.randomSeedUsage);
+                        xdata.randomSeedUsage++;
+                        ProcessExtraRecursive(frame, vehicle);
+                    }
+                }
+            }
+        }
+
+        if (RwFrame* child = frame->child)
+            FindNodesRecursive(child, vehicle);
+        if (RwFrame* next = frame->next)
+            FindNodesRecursive(next, vehicle);
+        return;
+    }
+}
+
+// ============================================================
+// Plugin
+// ============================================================
+
+class VehFuncsLight
+{
+public:
+    VehFuncsLight()
+    {
+        lg.open("VehFuncsLight.log", fstream::out | fstream::trunc);
+        lg << "VehFuncs Light started\n";
+        lg.flush();
+
+        // Junior exact
+        MakeJMP(0x004C8E30, CustomCollapseFramesCB);
+
+        MakeInline<0x004C8FA1, 0x004C8FA1 + 6>([](reg_pack& regs)
+            {
+                if (regs.eax == 0) regs.eax = 1;
+                *(uint32_t*)(regs.esp + 0x64 - 0x34) = regs.eax;
+                regs.eax = *(uint32_t*)regs.edx;
+            });
+
+        // Junior: FillFrameArray crash fix / hierarchy id clamp
+        patch::RedirectCall(0x004C5396, CheckCrashFillFrameArrayCB, true);
+
+        // Junior: register frame plugin
+        Events::attachRwPluginsEvent += []
+            {
+                FramePluginOffset = RwFrameRegisterPlugin(
+                    sizeof(FramePlugin), PLUGIN_ID_STR,
+                    (RwPluginObjectConstructor)FramePlugin::Init,
+                    (RwPluginObjectDestructor)FramePlugin::Destroy,
+                    (RwPluginObjectCopy)FramePlugin::Copy);
+            };
+
+        lg << "Collapse + ug_dummy + FillFrameArray + FramePlugin (Junior)\n";
+        lg.flush();
+
+        Events::initScriptsEvent.before += []
+            {
+                AtomicAlphaCallBack = ReadMemory<uintptr_t>(0x4C7842, false);
+                lg << "AtomicAlphaCallBack = 0x" << hex << AtomicAlphaCallBack << dec << "\n";
+
+                // Junior: FindDamage during preprocess (installed at game init)
+                MakeCALL(0x4C9173, FindDamage::CustomFindDamageAtomics, true);
+                WriteMemory<uint32_t>(0x4C916D + 1, (uint32_t)(uintptr_t)&FindDamage::CustomFindDamageAtomicsCB, true);
+
+                lg << "FindDamage hooked (Junior)\n";
+                lg.flush();
+            };
+
+        // Junior: if IVF hooked the collapse call-site pointer, force it back to 0x4C8E30
+        // so our MakeJMP on CollapseFramesCB is actually used.
+        Events::initScriptsEvent.after += []
+            {
+                static bool once = false;
+                if (once) return;
+                once = true;
+                uint32_t ptr = ReadMemory<uint32_t>(0x004C9148, true);
+                if (ptr != 0x004C8E30)
+                {
+                    lg << "IVF/other collapse ptr was 0x" << hex << ptr
+                        << " - restoring 0x4C8E30 (Junior)\n" << dec;
+                    WriteMemory(0x004C9148, (int)0x004C8E30, true);
+                }
+                else
+                {
+                    lg << "Collapse call ptr 0x4C9148 already 0x4C8E30\n";
+                }
+                uint8_t b = ReadMemory<uint8_t>(0x4C8E30, true);
+                lg << "byte at 0x4C8E30 = 0x" << hex << (int)b << dec;
+                if (b == 0xE9)
+                    lg << " (JMP OK)\n";
+                else
+                    lg << " (NOT JMP!)\n";
+                lg.flush();
+            };
+
+        Events::vehicleSetModelEvent += [](CVehicle* vehicle, int)
+            {
+                ExtendedData& d = xData.Get(vehicle);
+                d.nodesProcess = true;
+                if (d.randomSeed == 0)
+                    d.randomSeed = rand();
+                d.randomSeedUsage = 0;
+            };
+
+        Events::vehicleRenderEvent.before += [](CVehicle* vehicle)
+            {
+                if (!vehicle || !vehicle->m_pRwClump) return;
+                ExtendedData& d = xData.Get(vehicle);
+                if (!d.nodesProcess) return;
+
+                if (useLog)
+                {
+                    lg << "\n=== vehicle " << vehicle->m_nModelIndex
+                        << " seed " << d.randomSeed << " ===\n";
+                    lg.flush();
+                }
+
+                getClassList().clear();
+                d.randomSeedUsage = 0;
+
+                RwFrame* root = (RwFrame*)vehicle->m_pRwClump->object.parent;
+                if (root)
+                    FindNodesRecursive(root, vehicle);
+
+                if (useLog)
+                {
+                    lg << "ClassList:";
+                    for (const string& c : getClassList())
+                        lg << " [" << c << "]";
+                    lg << "\n";
+                    lg.flush();
+                }
+
+                d.nodesProcess = false;
+            };
+    }
+} vehFuncsLight;
+
+
+extern "C" __declspec(dllexport) void Ext_SetCarSeed(CVehicle* vehicle, int seed)
+{
+    if (!vehicle) return;
+    ExtendedData& d = xData.Get(vehicle);
+    d.randomSeed = seed;
+    d.randomSeedUsage = 0;
+    d.nodesProcess = true;
+}
+
+extern "C" __declspec(dllexport) int Ext_GetCarSeed(CVehicle* vehicle)
+{
+    if (!vehicle) return 0;
+    return xData.Get(vehicle).randomSeed;
+}
