@@ -11,14 +11,11 @@
 #include <vector>
 #include <cstring>
 #include <cstdlib>
-#include <fstream>
 
 using namespace plugin;
 using namespace std;
 using namespace injector;
 
-static fstream lg;
-static bool useLog = true;
 static uintptr_t AtomicAlphaCallBack = 0;
 
 
@@ -376,10 +373,6 @@ static void ProcessClassesRecursive(RwFrame* frame, CVehicle* vehicle, bool bSub
     else if (selectVariations > totalClass)
         selectVariations = totalClass;
 
-    if (useLog)
-        lg << "ProcessClasses: " << totalClass << " under '" << name
-        << "' select=" << selectVariations << "\n";
-
     int i = 0;
     while (i < selectVariations)
     {
@@ -392,8 +385,6 @@ static void ProcessClassesRecursive(RwFrame* frame, CVehicle* vehicle, bool bSub
                 continue;
         }
 
-        if (useLog)
-            lg << "ProcessClasses: SELECTED '" << GetFrameNodeName(classNodes[random]) << "'\n";
 
         if (classNodes[random]->child)
             ProcessClassesRecursive(classNodes[random], vehicle, true);
@@ -417,16 +408,12 @@ static void ProcessClassesRecursive(RwFrame* frame, CVehicle* vehicle, bool bSub
                 if (classNameFixed.length() > 0)
                 {
                     getClassList().push_back(classNameFixed);
-                    if (useLog)
-                        lg << "ProcessClasses: classList += '" << classNameFixed << "'\n";
                 }
             }
         }
         else
         {
             getClassList().push_back(className);
-            if (useLog)
-                lg << "ProcessClasses: classList += '" << className << "'\n";
         }
 
         classNodes[random] = nullptr;
@@ -442,7 +429,6 @@ static void ProcessExtraRecursive(RwFrame* frame, CVehicle* vehicle)
 {
     string name = GetFrameNodeName(frame);
     name = name.substr(0, 24);
-    if (useLog) lg << "Extras: Processing node: '" << name << "'\n";
 
     RwFrame* tempFrame = frame->child;
     if (tempFrame != nullptr)
@@ -500,7 +486,6 @@ static void ProcessExtraRecursive(RwFrame* frame, CVehicle* vehicle)
                                     if (frameClass.length() == className.length() && strcmp(&frameClass[0], &className[0]) == 0)
                                     {
                                         extraFramesMatchClass[classFrames] = tempFrame;
-                                        if (useLog) lg << "Extras: Added to match class: " << tempFrameName << "\n";
                                         classFrames++;
                                         break;
                                     }
@@ -527,16 +512,13 @@ static void ProcessExtraRecursive(RwFrame* frame, CVehicle* vehicle)
         extraFrames[(frames + 1)] = (RwFrame*)1;
         extraFramesMatchClass[(classFrames + 1)] = (RwFrame*)1;
 
-        if (useLog) lg << "Extras: Childs found: " << frames << "\n";
         if (classFrames > 0)
-            if (useLog) lg << "Extras: Class childs found: " << classFrames << "\n";
 
-        if (selectVariations == -1)
-        {
-            if (frames == 1) selectVariations = 0;
-            else selectVariations = 1;
-        }
-        if (useLog) lg << "Extras: Select variations: " << selectVariations << "\n";
+            if (selectVariations == -1)
+            {
+                if (frames == 1) selectVariations = 0;
+                else selectVariations = 1;
+            }
 
         int i = 0;
         int random = 0;
@@ -552,7 +534,6 @@ static void ProcessExtraRecursive(RwFrame* frame, CVehicle* vehicle)
                 if (extraFramesMatchClass[random] != nullptr)
                 {
                     i++;
-                    if (useLog) lg << "Extras: Starting new node (class match) " << i << " of " << selectVariations << " \n";
                     ProcessExtraRecursive(extraFramesMatchClass[random], vehicle);
 
                     RemoveFrameClassFromNormalArray(extraFramesMatchClass[random], extraFrames);
@@ -573,7 +554,6 @@ static void ProcessExtraRecursive(RwFrame* frame, CVehicle* vehicle)
                         continue;
                     }
                     i++;
-                    if (useLog) lg << "Extras: Starting new node " << i << " of " << selectVariations << " \n";
                     ProcessExtraRecursive(extraFrames[random], vehicle);
 
                     extraFrames[random] = nullptr;
@@ -587,7 +567,6 @@ static void ProcessExtraRecursive(RwFrame* frame, CVehicle* vehicle)
                     }
                     if (k == frames)
                     {
-                        if (useLog) lg << "Extras: There is no more extras to select \n";
                         break;
                     }
                 }
@@ -602,7 +581,6 @@ static void ProcessExtraRecursive(RwFrame* frame, CVehicle* vehicle)
                 DestroyNodeHierarchyRecursive(extraFrames[j]);
         }
     }
-    else if (useLog) lg << "Extras: Node has no child \n";
 }
 
 // ============================================================
@@ -622,7 +600,6 @@ static void FindNodesRecursive(RwFrame* frame, CVehicle* vehicle)
             {
                 if (name.find("f_class") != string::npos)
                 {
-                    if (useLog) lg << "FindNodes: f_class '" << name << "'\n";
                     ProcessClassesRecursive(frame, vehicle, false);
                     if (RwFrame* tempFrame = frame->next)
                     {
@@ -634,7 +611,6 @@ static void FindNodesRecursive(RwFrame* frame, CVehicle* vehicle)
 
                 if (name.find("f_extras") != string::npos)
                 {
-                    if (useLog) lg << "FindNodes: f_extras '" << name << "'\n";
                     if (frame->child)
                     {
                         srand(xdata.randomSeed + xdata.randomSeedUsage);
@@ -662,13 +638,10 @@ class VehFuncsLight
 public:
     VehFuncsLight()
     {
-        lg.open("VehFuncsLight.log", fstream::out | fstream::trunc);
-        lg << "VehFuncs Light started\n";
-        lg.flush();
-
-        // Junior exact
+        // Junior: keep f_* / extra frames during hierarchy preprocess
         MakeJMP(0x004C8E30, CustomCollapseFramesCB);
 
+        // Junior: ug_dummy hierarchy id fix
         MakeInline<0x004C8FA1, 0x004C8FA1 + 6>([](reg_pack& regs)
             {
                 if (regs.eax == 0) regs.eax = 1;
@@ -676,10 +649,10 @@ public:
                 regs.eax = *(uint32_t*)regs.edx;
             });
 
-        // Junior: FillFrameArray crash fix / hierarchy id clamp
+        // Junior: FillFrameArray hierarchy id clamp
         patch::RedirectCall(0x004C5396, CheckCrashFillFrameArrayCB, true);
 
-        // Junior: register frame plugin
+        // Junior: frame plugin (FRAME_EXTENSION)
         Events::attachRwPluginsEvent += []
             {
                 FramePluginOffset = RwFrameRegisterPlugin(
@@ -689,47 +662,23 @@ public:
                     (RwPluginObjectCopy)FramePlugin::Copy);
             };
 
-        lg << "Collapse + ug_dummy + FillFrameArray + FramePlugin (Junior)\n";
-        lg.flush();
-
         Events::initScriptsEvent.before += []
             {
                 AtomicAlphaCallBack = ReadMemory<uintptr_t>(0x4C7842, false);
-                lg << "AtomicAlphaCallBack = 0x" << hex << AtomicAlphaCallBack << dec << "\n";
 
-                // Junior: FindDamage during preprocess (installed at game init)
+                // Junior: find damage atomics walk
                 MakeCALL(0x4C9173, FindDamage::CustomFindDamageAtomics, true);
                 WriteMemory<uint32_t>(0x4C916D + 1, (uint32_t)(uintptr_t)&FindDamage::CustomFindDamageAtomicsCB, true);
-
-                lg << "FindDamage hooked (Junior)\n";
-                lg.flush();
             };
 
-        // Junior: if IVF hooked the collapse call-site pointer, force it back to 0x4C8E30
-        // so our MakeJMP on CollapseFramesCB is actually used.
+        // Junior: restore collapse call-site if IVF (or similar) redirected it
         Events::initScriptsEvent.after += []
             {
                 static bool once = false;
                 if (once) return;
                 once = true;
-                uint32_t ptr = ReadMemory<uint32_t>(0x004C9148, true);
-                if (ptr != 0x004C8E30)
-                {
-                    lg << "IVF/other collapse ptr was 0x" << hex << ptr
-                        << " - restoring 0x4C8E30 (Junior)\n" << dec;
+                if (ReadMemory<uint32_t>(0x004C9148, true) != 0x004C8E30)
                     WriteMemory(0x004C9148, (int)0x004C8E30, true);
-                }
-                else
-                {
-                    lg << "Collapse call ptr 0x4C9148 already 0x4C8E30\n";
-                }
-                uint8_t b = ReadMemory<uint8_t>(0x4C8E30, true);
-                lg << "byte at 0x4C8E30 = 0x" << hex << (int)b << dec;
-                if (b == 0xE9)
-                    lg << " (JMP OK)\n";
-                else
-                    lg << " (NOT JMP!)\n";
-                lg.flush();
             };
 
         Events::vehicleSetModelEvent += [](CVehicle* vehicle, int)
@@ -747,13 +696,6 @@ public:
                 ExtendedData& d = xData.Get(vehicle);
                 if (!d.nodesProcess) return;
 
-                if (useLog)
-                {
-                    lg << "\n=== vehicle " << vehicle->m_nModelIndex
-                        << " seed " << d.randomSeed << " ===\n";
-                    lg.flush();
-                }
-
                 getClassList().clear();
                 d.randomSeedUsage = 0;
 
@@ -761,19 +703,11 @@ public:
                 if (root)
                     FindNodesRecursive(root, vehicle);
 
-                if (useLog)
-                {
-                    lg << "ClassList:";
-                    for (const string& c : getClassList())
-                        lg << " [" << c << "]";
-                    lg << "\n";
-                    lg.flush();
-                }
-
                 d.nodesProcess = false;
             };
     }
 } vehFuncsLight;
+
 
 
 extern "C" __declspec(dllexport) void Ext_SetCarSeed(CVehicle* vehicle, int seed)
