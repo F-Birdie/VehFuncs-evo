@@ -1,10 +1,13 @@
 /*
- * VehFuncs Light — f_class + f_extras only
- * Logic taken from Junior_Djjr VehFuncs (RecursiveExtras / collapse / destroy)
+ * VehFuncs Light — f_class + f_extras + variable wheels
+ * Logic taken from Junior_Djjr VehFuncs (RecursiveExtras / collapse / wheels)
  * https://github.com/JuniorDjjr/VehFuncs
  */
 #include "plugin.h"
 #include "CVisibilityPlugins.h"
+#include "CAutomobile.h"
+#include "CClumpModelInfo.h"
+#include "CModelInfo.h"
 #include "assembly.hpp"
 #include <string>
 #include <list>
@@ -114,6 +117,14 @@ static char* GetFrameNodeName(RwFrame* frame)
     return ((char* (__cdecl*)(RwFrame*))0x72FB30)(frame);
 }
 
+static void SetFrameNodeName(RwFrame* frame, const char* name)
+{
+    char* buf = GetFrameNodeName(frame);
+    if (!buf) return;
+    strncpy(buf, name, 23);
+    buf[23] = 0;
+}
+
 static int Random(int min, int max)
 {
     if (min >= max) return min;
@@ -151,6 +162,7 @@ public:
     int randomSeed;
     int randomSeedUsage;
     RwFrame* classFrame;
+    RwFrame* wheelFrame[6];
 
     ExtendedData(CVehicle*)
     {
@@ -158,6 +170,7 @@ public:
         randomSeed = rand();
         randomSeedUsage = 0;
         classFrame = nullptr;
+        memset(wheelFrame, 0, sizeof(wheelFrame));
     }
 };
 
@@ -373,6 +386,8 @@ static void ProcessClassesRecursive(RwFrame* frame, CVehicle* vehicle, bool bSub
     else if (selectVariations > totalClass)
         selectVariations = totalClass;
 
+
+
     int i = 0;
     while (i < selectVariations)
     {
@@ -584,6 +599,222 @@ static void ProcessExtraRecursive(RwFrame* frame, CVehicle* vehicle)
 }
 
 // ============================================================
+// Junior Variable Wheels (SetWheel / CloneNode)
+// Wiki: [EN] Variable Wheels — f_wheel_**** binary mask
+// ============================================================
+
+static bool createCloneNoRender = false;
+
+// Clone hierarchy under parent (Junior Utilities.cpp)
+static void CloneNode(RwFrame* frame, RpClump* clump, RwFrame* parent, bool isRoot, bool isVarWheel)
+{
+    if (!frame) return;
+
+    if (isVarWheel)
+        FRAME_EXTENSION(frame)->flags.bIsVarWheel = true;
+
+    if (isRoot)
+    {
+        // rarely used for wheels; clone children onto parent
+        if (RwFrame* nextFrame = frame->child)
+            CloneNode(nextFrame, clump, parent, false, isVarWheel);
+        return;
+    }
+
+    RwFrame* newFrame = RwFrameCreate();
+    memcpy(&newFrame->modelling, &frame->modelling, sizeof(RwMatrix));
+    RwMatrixUpdate(&newFrame->modelling);
+
+    const string frameName = GetFrameNodeName(frame);
+    SetFrameNodeName(newFrame, frameName.c_str());
+
+    RpAtomic* atomic = (RpAtomic*)GetFirstObject(frame);
+    if (atomic)
+    {
+        RpAtomic* newAtomic = RpAtomicClone(atomic);
+        RpAtomicSetFrame(newAtomic, newFrame);
+        RpClumpAddAtomic(clump, newAtomic);
+    }
+
+    RwFrameAddChild(parent, newFrame);
+
+    if (createCloneNoRender)
+        FRAME_EXTENSION(newFrame)->flags.bNeverRender = true;
+
+    if (RwFrame* nextFrame = frame->child)
+        CloneNode(nextFrame, clump, newFrame, false, isVarWheel);
+    if (RwFrame* nextFrame = frame->next)
+        CloneNode(nextFrame, clump, parent, false, isVarWheel);
+}
+
+static int CVehicle__GetReplacementUpgrade(CVehicle* _this, int nodeId)
+{
+    return ((int(__thiscall*)(CVehicle*, int))0x6D3A50)(_this, nodeId);
+}
+
+// Junior SetWheel — exact logic
+static void SetWheel(RwFrame* frame[6], CVehicle* vehicle)
+{
+    createCloneNoRender = false;
+    bool hasTuningWheel = CVehicle__GetReplacementUpgrade(vehicle, 2) != -1;
+
+    for (int j = 0; j < 6; j++)
+    {
+        if (!frame[j])
+            continue;
+
+        if (frame[j]->object.parent && FRAME_EXTENSION(frame[j])->owner == vehicle)
+        {
+            const string name = GetFrameNodeName(frame[j]);
+            // f_wheel_******  positions 8..13 are the RF RB LB LF RM LM flags
+            for (int i = 8; i <= 13; i++)
+            {
+                if (i >= (int)name.length() || name[i] == '\0' || name[i] == ':' || name[i] == '?')
+                    break;
+                if (name[i] != '1')
+                    continue;
+
+                int wheelId = 0;
+                int subClass = vehicle->m_nVehicleSubClass;
+                switch (i)
+                {
+                case 8:
+                    if (subClass == 9 || subClass == 10) wheelId = 4;
+                    else wheelId = CAR_WHEEL_RF;
+                    break;
+                case 9:
+                    if (subClass == 9 || subClass == 10) wheelId = 5;
+                    else wheelId = CAR_WHEEL_RB;
+                    break;
+                case 10:
+                    wheelId = CAR_WHEEL_LB;
+                    break;
+                case 11:
+                    wheelId = CAR_WHEEL_LF;
+                    break;
+                case 12:
+                    wheelId = CAR_WHEEL_RM;
+                    break;
+                case 13:
+                    wheelId = CAR_WHEEL_LM;
+                    break;
+                default:
+                    wheelId = 0;
+                    break;
+                }
+
+                if (!wheelId)
+                    continue;
+
+                RwFrame* wheelFrame = nullptr;
+                if (subClass == 9 || subClass == 10)
+                    wheelFrame = CClumpModelInfo::GetFrameFromId(vehicle->m_pRwClump, wheelId);
+                else
+                    wheelFrame = reinterpret_cast<CAutomobile*>(vehicle)->m_aCarNodes[wheelId];
+
+                if (wheelFrame && frame[j]->child)
+                {
+                    createCloneNoRender = hasTuningWheel;
+                    CloneNode(frame[j]->child, vehicle->m_pRwClump, wheelFrame, false, true);
+                    createCloneNoRender = false;
+                    CVisibilityPlugins::SetFrameHierarchyId(frame[j]->child, wheelId);
+                }
+            }
+
+            if (frame[j]->child)
+                DestroyNodeHierarchyRecursive(frame[j]->child);
+            RwFrameDestroy(frame[j]);
+            continue;
+        }
+
+        ExtendedData& xdata = xData.Get(vehicle);
+        xdata.wheelFrame[j] = nullptr;
+    }
+}
+
+// ============================================================
+// Junior upgrade add/remove — toggle bNeverRender on existing frames
+// so f_wheel clones reappear when a previewed tuning wheel is cancelled
+// ============================================================
+
+static RwFrame* __cdecl CustomRwFrameForAllChildren_AddUpgrade_Recurse(RwFrame* frame, RwFrame* (__cdecl* callback)(RwFrame*, void*), void* data)
+{
+    if (!FRAME_EXTENSION(frame)->flags.bDestroyOnRemoveUpgrade)
+        FRAME_EXTENSION(frame)->flags.bNeverRender = true;
+
+    if (RwFrame* newFrame = frame->child)
+        CustomRwFrameForAllChildren_AddUpgrade_Recurse(newFrame, callback, data);
+    if (RwFrame* newFrame = frame->next)
+        CustomRwFrameForAllChildren_AddUpgrade_Recurse(newFrame, callback, data);
+    return frame;
+}
+
+static RwFrame* __cdecl CustomRwFrameForAllChildren_AddUpgrade(RwFrame* frame, RwFrame* (__cdecl* callback)(RwFrame*, void*), void* data)
+{
+    if (RwFrame* newFrame = frame->child)
+        CustomRwFrameForAllChildren_AddUpgrade_Recurse(newFrame, callback, data);
+    return frame;
+}
+
+static RwFrame* __cdecl CustomRwFrameForAllChildren_RemoveUpgrade_Recurse(RwFrame* frame, void* data)
+{
+    // Junior: destroy upgrade-owned frames; show everything else again
+    if (FRAME_EXTENSION(frame)->flags.bDestroyOnRemoveUpgrade)
+    {
+        // RemoveObjectsCB @ 0x4C7C10 (common) — remove atomics from frame for this clump path
+        RwFrameForAllObjects(frame, (RwObjectCallBack)0x4C7C10, data);
+    }
+    else
+    {
+        FRAME_EXTENSION(frame)->flags.bNeverRender = false;
+    }
+
+    RwFrameForAllChildren(frame, (RwFrameCallBack)CustomRwFrameForAllChildren_RemoveUpgrade_Recurse, data);
+    return frame;
+}
+
+static RwFrame* __cdecl CustomRwFrameForAllChildren_RemoveUpgrade(RwFrame* frame, RwFrame* (__cdecl* callback)(RwFrame*, void*), void* data)
+{
+    RwFrameForAllChildren(frame, (RwFrameCallBack)CustomRwFrameForAllChildren_RemoveUpgrade_Recurse, data);
+    return frame;
+}
+
+// Junior NeverRender — hide frames with bNeverRender (tuning-wheel clones)
+static int neverRenderValid = 1;
+
+static void __cdecl NeverRenderCheck(RpAtomic* atomic)
+{
+    RwFrame* frame = (RwFrame*)atomic->object.object.parent;
+    if (frame && FRAME_EXTENSION(frame)->flags.bNeverRender)
+    {
+        neverRenderValid = 0;
+        return;
+    }
+    neverRenderValid = 1;
+}
+
+static void __declspec(naked) NeverRender()
+{
+    __asm {
+        push edi
+        call NeverRenderCheck
+        add esp, 4
+        mov eax, [edi + 4]
+        push eax
+        mov edx, 0x7F0990
+        call edx
+        cmp neverRenderValid, 1
+        je NeverRender_IsValid
+        add esp, 4
+        push 0x749B4E
+        ret
+        NeverRender_IsValid :
+        push 0x749B47
+            ret
+    }
+}
+
+// ============================================================
 // FindNodes — Junior-style walk
 // ============================================================
 
@@ -616,6 +847,20 @@ static void FindNodesRecursive(RwFrame* frame, CVehicle* vehicle)
                         srand(xdata.randomSeed + xdata.randomSeedUsage);
                         xdata.randomSeedUsage++;
                         ProcessExtraRecursive(frame, vehicle);
+                    }
+                }
+            }
+
+            // Variable wheels — f_wheel_**** (Junior)
+            if (name.find("f_wheel") != string::npos)
+            {
+                for (int i = 0; i < 6; i++)
+                {
+                    if (!xdata.wheelFrame[i])
+                    {
+                        xdata.wheelFrame[i] = frame;
+                        FRAME_EXTENSION(frame)->owner = vehicle;
+                        break;
                     }
                 }
             }
@@ -669,6 +914,29 @@ public:
                 // Junior: find damage atomics walk
                 MakeCALL(0x4C9173, FindDamage::CustomFindDamageAtomics, true);
                 WriteMemory<uint32_t>(0x4C916D + 1, (uint32_t)(uintptr_t)&FindDamage::CustomFindDamageAtomicsCB, true);
+
+                // Junior: NeverRender for bNeverRender (var wheels when tuning wheel installed)
+                MakeNOP(0x00749B3E, 9, true);
+                MakeJMP(0x00749B3E, NeverRender);
+
+                // Junior: when wheel/other upgrades are added or removed, hide/show var-wheel clones
+                MakeCALL(0x006D386C, CustomRwFrameForAllChildren_AddUpgrade);
+                MakeCALL(0x006D3A18, CustomRwFrameForAllChildren_RemoveUpgrade);
+
+                // Junior: mark upgrade exhaust/wheel frames for destroy-on-remove
+                MakeInline<0x006D3746, 0x006D3746 + 5>([](reg_pack& regs)
+                    {
+                        regs.ecx = 0x3F800000; // original code
+                        RwFrame* frame = (RwFrame*)regs.edi;
+                        FRAME_EXTENSION(frame)->flags.bDestroyOnRemoveUpgrade = true;
+                    });
+                MakeInline<0x006D3539, 0x006D3539 + 5>([](reg_pack& regs)
+                    {
+                        regs.esi = regs.eax;
+                        regs.edi = *(uintptr_t*)(regs.esi + 0x4);
+                        RwFrame* frame = (RwFrame*)regs.edi;
+                        FRAME_EXTENSION(frame)->flags.bDestroyOnRemoveUpgrade = true;
+                    });
             };
 
         // Junior: restore collapse call-site if IVF (or similar) redirected it
@@ -688,6 +956,7 @@ public:
                 if (d.randomSeed == 0)
                     d.randomSeed = rand();
                 d.randomSeedUsage = 0;
+                memset(d.wheelFrame, 0, sizeof(d.wheelFrame));
             };
 
         Events::vehicleRenderEvent.before += [](CVehicle* vehicle)
@@ -702,6 +971,10 @@ public:
                 RwFrame* root = (RwFrame*)vehicle->m_pRwClump->object.parent;
                 if (root)
                     FindNodesRecursive(root, vehicle);
+
+                // Junior: apply variable wheels after node walk
+                if (d.wheelFrame[0])
+                    SetWheel(d.wheelFrame, vehicle);
 
                 d.nodesProcess = false;
             };
