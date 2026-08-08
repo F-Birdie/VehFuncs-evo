@@ -10,6 +10,7 @@
 #include "CModelInfo.h"
 #include "CVehicleModelInfo.h"
 #include "CStreaming.h"
+#include "CTimer.h"
 #include "assembly.hpp"
 #include <string>
 #include <list>
@@ -28,6 +29,21 @@ static uint32_t txdIndexStart = 20000; // set from game code at init
 
 
 // ============================================================
+// Junior MatrixBackup — restore popup / moving parts to rest pose
+// ============================================================
+
+struct MatrixBackup
+{
+    RwV3d right;
+    RwV3d up;
+    RwUInt32 pad1;
+    RwV3d at;
+    RwUInt32 pad2;
+    RwV3d pos;
+    RwUInt32 pad3;
+};
+
+// ============================================================
 // Junior FramePlugin (VehFuncsCommon.h) — required by FRAME_EXTENSION
 // ============================================================
 
@@ -37,7 +53,7 @@ static unsigned int FramePluginOffset = 0;
 
 struct FramePlugin
 {
-    void* origMatrix;
+    void* origMatrix; // MatrixBackup*
     CVehicle* owner;
     int8_t LODdist;
     struct {
@@ -58,6 +74,11 @@ struct FramePlugin
     }
     static RwFrame* Destroy(RwFrame* frame)
     {
+        if (FRAME_EXTENSION(frame)->origMatrix)
+        {
+            delete (MatrixBackup*)FRAME_EXTENSION(frame)->origMatrix;
+            FRAME_EXTENSION(frame)->origMatrix = nullptr;
+        }
         return frame;
     }
     static RwFrame* Copy(RwFrame* copy, RwFrame*)
@@ -65,6 +86,34 @@ struct FramePlugin
         return copy;
     }
 };
+
+static void RestoreMatrixBackup(RwMatrix* dest, MatrixBackup* backup)
+{
+    if (!backup || !dest) return;
+    dest->at = backup->at;
+    dest->pos = backup->pos;
+    dest->right = backup->right;
+    dest->up = backup->up;
+    RwMatrixUpdate(dest);
+}
+
+static bool CreateMatrixBackup(RwFrame* frame)
+{
+    MatrixBackup* backup = new MatrixBackup();
+    if (!backup)
+    {
+        FRAME_EXTENSION(frame)->origMatrix = nullptr;
+        return false;
+    }
+    RwMatrix* origin = &frame->modelling;
+    backup->at = origin->at;
+    backup->pos = origin->pos;
+    backup->right = origin->right;
+    backup->up = origin->up;
+    FRAME_EXTENSION(frame)->origMatrix = backup;
+    return true;
+}
+
 
 // ============================================================
 // Junior Patches::FindDamage — exact
@@ -171,6 +220,8 @@ public:
     list<RwFrame*> spoilerFrames;
     int color[4]; // -1 = leave game default
     int8_t paintjob; // -1 = none, 1..N = remap (Junior stores 1-based)
+    RwFrame* popupFrame[2]; // [0]=f_popl [1]=f_popr
+    float popupProgress[2];
     struct {
         unsigned char bUpgradesUpdated : 1;
         unsigned char bPreservePaintjobColor : 1;
@@ -186,6 +237,8 @@ public:
         spoilerFrames.clear();
         color[0] = color[1] = color[2] = color[3] = -1;
         paintjob = -1;
+        popupFrame[0] = popupFrame[1] = nullptr;
+        popupProgress[0] = popupProgress[1] = 0.0f;
         flags.bUpgradesUpdated = 0;
         flags.bPreservePaintjobColor = 0;
     }
@@ -924,6 +977,133 @@ static void ProcessSpoiler(CVehicle* vehicle, list<RwFrame*> frames, bool after)
 }
 
 // ============================================================
+// Junior popup headlights — f_popl / f_popr
+// Syntax: f_popl=ax45z10s2  (a=axis rotation, xyz=translate*0.01, s=speed)
+// ============================================================
+
+static void ProcessPopup(CVehicle* vehicle, ExtendedData* xdata)
+{
+    float speed = 0.0f;
+    float ax = 30.0f, ay = 0.0f, az = 0.0f;
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+
+    for (int i = 0; i < 2; i++)
+    {
+        if (xdata->popupFrame[i] == nullptr)
+            continue;
+
+        RwFrame* frame = xdata->popupFrame[i];
+        if (!(frame->object.parent && FRAME_EXTENSION(frame)->owner == vehicle))
+        {
+            xdata->popupFrame[i] = nullptr;
+            xdata->popupProgress[i] = 0.0f;
+            continue;
+        }
+
+        const string name = GetFrameNodeName(frame);
+
+        // Parse f_pop?=ax.. (name[6] == '=')
+        if (name.length() > 6 && name[6] == '=')
+        {
+            speed = 0.0f;
+            ax = ay = az = 0.0f;
+            x = y = z = 0.0f;
+            for (unsigned int j = 7; j < name.length(); j++)
+            {
+                switch (name[j])
+                {
+                case 'a':
+                    if (j + 1 < name.length())
+                    {
+                        switch (name[j + 1])
+                        {
+                        case 'x': ax = (float)atof(&name[j + 2]); break;
+                        case 'y': ay = (float)atof(&name[j + 2]); break;
+                        case 'z': az = (float)atof(&name[j + 2]); break;
+                        }
+                    }
+                    break;
+                case 's':
+                    speed = (float)atof(&name[j + 1]) * (CTimer::ms_fTimeStep * 1.66666f) * 0.005f;
+                    break;
+                case 'x':
+                    if (j > 0 && name[j - 1] == 'a') break;
+                    x = (float)atof(&name[j + 1]) * 0.01f;
+                    break;
+                case 'y':
+                    if (j > 0 && name[j - 1] == 'a') break;
+                    y = (float)atof(&name[j + 1]) * 0.01f;
+                    break;
+                case 'z':
+                    if (j > 0 && name[j - 1] == 'a') break;
+                    z = (float)atof(&name[j + 1]) * 0.01f;
+                    break;
+                }
+                if (name[j] == '_') break;
+            }
+        }
+
+        if (speed == 0.0f)
+            speed = 4.0f * (CTimer::ms_fTimeStep * 1.66666f) * 0.005f;
+
+        // Lights on/off (plugin-sdk: bLightsOn, not m_nVehicleFlags)
+        bool lightsOn;
+        if (vehicle->bLightsOn || vehicle->m_nOverrideLights == 2)
+        {
+            if (xdata->popupProgress[i] == 1.0f) continue;
+            lightsOn = true;
+        }
+        else
+        {
+            if (xdata->popupProgress[i] == 0.0f) continue;
+            lightsOn = false;
+        }
+
+        // Skip if that headlight is smashed (Junior)
+        CAutomobile* automobile = reinterpret_cast<CAutomobile*>(vehicle);
+        // LIGHT_FRONT_LEFT=0, LIGHT_FRONT_RIGHT=1
+        if (i == 1 && automobile->m_damageManager.GetLightStatus((eLights)1)) continue;
+        if (i == 0 && automobile->m_damageManager.GetLightStatus((eLights)0)) continue;
+
+        if (lightsOn)
+            xdata->popupProgress[i] += speed;
+        else
+            xdata->popupProgress[i] -= speed;
+
+        RestoreMatrixBackup(&frame->modelling, (MatrixBackup*)FRAME_EXTENSION(frame)->origMatrix);
+
+        float progress = xdata->popupProgress[i];
+        if (progress >= 1.0f)
+        {
+            xdata->popupProgress[i] = 1.0f;
+            RwV3d vec = { x, y, z };
+            RwFrameTranslate(frame, &vec, rwCOMBINEPRECONCAT);
+            RwFrameRotate(frame, (RwV3d*)0x008D2E00, ax, rwCOMBINEPRECONCAT);
+            RwFrameRotate(frame, (RwV3d*)0x008D2E0C, ay, rwCOMBINEPRECONCAT);
+            RwFrameRotate(frame, (RwV3d*)0x008D2E18, az, rwCOMBINEPRECONCAT);
+        }
+        else if (progress <= 0.0f)
+        {
+            xdata->popupProgress[i] = 0.0f;
+            RwV3d vec = { 0, 0, 0 };
+            RwFrameTranslate(frame, &vec, rwCOMBINEPRECONCAT);
+            RwFrameRotate(frame, (RwV3d*)0x008D2E00, 0, rwCOMBINEPRECONCAT);
+            RwFrameRotate(frame, (RwV3d*)0x008D2E0C, 0, rwCOMBINEPRECONCAT);
+            RwFrameRotate(frame, (RwV3d*)0x008D2E18, 0, rwCOMBINEPRECONCAT);
+        }
+        else
+        {
+            RwV3d vec = { x * progress, y * progress, z * progress };
+            RwFrameTranslate(frame, &vec, rwCOMBINEPRECONCAT);
+            RwFrameRotate(frame, (RwV3d*)0x008D2E00, progress * ax, rwCOMBINEPRECONCAT);
+            RwFrameRotate(frame, (RwV3d*)0x008D2E0C, progress * ay, rwCOMBINEPRECONCAT);
+            RwFrameRotate(frame, (RwV3d*)0x008D2E18, progress * az, rwCOMBINEPRECONCAT);
+        }
+        RwFrameUpdateObjects(frame);
+    }
+}
+
+// ============================================================
 // Characteristics — only _cl= (force colors) for now
 // Junior: Characteristics.cpp FindVehicleCharacteristicsFromNode
 //         + SetCharacteristicsInRender color apply
@@ -1130,6 +1310,19 @@ static void FindNodesRecursive(RwFrame* frame, CVehicle* vehicle)
                 xdata.spoilerFrames.push_back(frame);
                 FRAME_EXTENSION(frame)->owner = vehicle;
             }
+
+            // Popup headlights — f_popl (left/0) / f_popr (right/1)
+            if (name.find("f_pop") != string::npos)
+            {
+                if (CreateMatrixBackup(frame))
+                {
+                    FRAME_EXTENSION(frame)->owner = vehicle;
+                    if (name.find("f_popl") != string::npos)
+                        xdata.popupFrame[0] = frame;
+                    else if (name.find("f_popr") != string::npos)
+                        xdata.popupFrame[1] = frame;
+                }
+            }
         }
 
         if (RwFrame* child = frame->child)
@@ -1290,6 +1483,41 @@ public:
                         CVehicle* veh = (CVehicle*)regs.edi;
                         xData.Get(veh).flags.bUpgradesUpdated = 1;
                     });
+
+                // Junior: Popup lights — suppress corona until popup rotation
+                // has actually finished (real address 0x006E1CD4)
+                MakeInline<0x006E1CD4, 0x006E1CD4 + 6>([](reg_pack& regs)
+                    {
+                        regs.eax = *(uint32_t*)(regs.esi + 0x590); // original instruction
+
+                        CVehicle* veh = (CVehicle*)regs.esi;
+                        ExtendedData& xdata = xData.Get(veh);
+
+                        if (xdata.popupFrame[0] != nullptr)
+                        {
+                            bool noLights = false;
+                            CAutomobile* automobile = (CAutomobile*)veh;
+
+                            if (automobile->m_damageManager.GetLightStatus((eLights)0)) // LIGHT_FRONT_LEFT smashed
+                            {
+                                if (xdata.popupProgress[1] != 1.0f)
+                                    noLights = true;
+                            }
+                            else if (automobile->m_damageManager.GetLightStatus((eLights)1)) // LIGHT_FRONT_RIGHT smashed
+                            {
+                                if (xdata.popupProgress[0] != 1.0f)
+                                    noLights = true;
+                            }
+                            else
+                            {
+                                if (xdata.popupProgress[0] != 1.0f && xdata.popupProgress[1] != 1.0f)
+                                    noLights = true;
+                            }
+
+                            if (noLights)
+                                *(uint32_t*)(regs.esp - 0x4) = 0x6E28EF; // skip past corona render
+                        }
+                    });
             };
 
         // Junior: restore collapse call-site if IVF (or similar) redirected it
@@ -1313,6 +1541,8 @@ public:
                 d.spoilerFrames.clear();
                 d.color[0] = d.color[1] = d.color[2] = d.color[3] = -1;
                 d.paintjob = -1;
+                d.popupFrame[0] = d.popupFrame[1] = nullptr;
+                d.popupProgress[0] = d.popupProgress[1] = 0.0f;
                 d.flags.bPreservePaintjobColor = 0;
                 d.flags.bUpgradesUpdated = 1; // apply spoiler visibility on first process
             };
@@ -1341,6 +1571,10 @@ public:
                     d.nodesProcess = false;
                     d.flags.bUpgradesUpdated = 1; // first-time spoiler visibility
                 }
+
+                // Junior: popup headlights (every frame while frames exist)
+                if (d.popupFrame[0] || d.popupFrame[1])
+                    ProcessPopup(vehicle, &d);
 
                 // Junior: hide f_spoiler when tuning spoiler is installed
                 if (d.flags.bUpgradesUpdated)
