@@ -929,6 +929,22 @@ static void ProcessSpoiler(CVehicle* vehicle, list<RwFrame*> frames, bool after)
 //         + SetCharacteristicsInRender color apply
 // ============================================================
 
+// Game audio helpers (Junior Characteristics.cpp)
+static void CVehicle__CancelVehicleEngineSound(CAEVehicleAudioEntity* audio, int soundId)
+{
+    ((void(__thiscall*)(CAEVehicleAudioEntity*, int))0x4F55C0)(audio, soundId);
+}
+
+static int CAEVehicleAudioEntity__RequestBankSlot(int id)
+{
+    return ((int(__cdecl*)(int))0x4F4D10)(id);
+}
+
+static void CAEVehicleAudioEntity__StoppedUsingBankSlot(int id)
+{
+    ((void(__cdecl*)(int))0x4F4DF0)(id);
+}
+
 static void FindVehicleCharacteristicsFromNode(RwFrame* frame, CVehicle* vehicle)
 {
     const string name = string(GetFrameNodeName(frame)).substr(0, 24);
@@ -984,6 +1000,44 @@ static void FindVehicleCharacteristicsFromNode(RwFrame* frame, CVehicle* vehicle
                 xdata.color[j] = -1; // '-', empty, etc.
             }
             j++;
+        }
+    }
+
+    // ---- _se= engine sound banks (Junior — applied immediately)
+    // Forms: _se=81,80  (accelerate bank, decelerate bank)
+    found = name.find("_se=");
+    if (found != string::npos)
+    {
+        int i = 4;
+        try {
+            int sound1 = stoi(&name[found + i]);
+
+            do {
+                ++i;
+                if ((found + i) >= 22)
+                    break;
+            } while (name[found + i] != ',');
+
+            if ((found + i) <= 22 && name[found + i] == ',')
+            {
+                ++i;
+                int sound2 = stoi(&name[found + i]);
+
+                vehicle->m_vehicleAudio.m_nEngineAccelerateSoundBankId = (short)sound1;
+                vehicle->m_vehicleAudio.m_nEngineDecelerateSoundBankId = (short)sound2;
+
+                int soundId = 0;
+                do
+                    CVehicle__CancelVehicleEngineSound(&vehicle->m_vehicleAudio, soundId++);
+                while (soundId < 12);
+
+                CAEVehicleAudioEntity__StoppedUsingBankSlot(vehicle->m_vehicleAudio.m_nEngineBankSlotId);
+                vehicle->m_vehicleAudio.m_nEngineBankSlotId =
+                    (short)CAEVehicleAudioEntity__RequestBankSlot(sound2);
+            }
+        }
+        catch (const exception&) {
+            // malformed _se= — ignore
         }
     }
 }
