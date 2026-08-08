@@ -1,5 +1,5 @@
 /*
- * VehFuncs Light — f_class + f_extras + variable wheels + f_spoiler
+ * VehFuncs Light — f_class + f_extras + variable wheels + f_spoiler + _cl= + _pj=
  * Logic taken from Junior_Djjr VehFuncs (RecursiveExtras / collapse / wheels)
  * https://github.com/JuniorDjjr/VehFuncs
  */
@@ -8,6 +8,8 @@
 #include "CAutomobile.h"
 #include "CClumpModelInfo.h"
 #include "CModelInfo.h"
+#include "CVehicleModelInfo.h"
+#include "CStreaming.h"
 #include "assembly.hpp"
 #include <string>
 #include <list>
@@ -15,12 +17,14 @@
 #include <cstring>
 #include <sstream>
 #include <cstdlib>
+#include <cctype>
 
 using namespace plugin;
 using namespace std;
 using namespace injector;
 
 static uintptr_t AtomicAlphaCallBack = 0;
+static uint32_t txdIndexStart = 20000; // set from game code at init
 
 
 // ============================================================
@@ -166,8 +170,10 @@ public:
     RwFrame* wheelFrame[6];
     list<RwFrame*> spoilerFrames;
     int color[4]; // -1 = leave game default
+    int8_t paintjob; // -1 = none, 1..N = remap (Junior stores 1-based)
     struct {
         unsigned char bUpgradesUpdated : 1;
+        unsigned char bPreservePaintjobColor : 1;
     } flags;
 
     ExtendedData(CVehicle*)
@@ -179,7 +185,9 @@ public:
         memset(wheelFrame, 0, sizeof(wheelFrame));
         spoilerFrames.clear();
         color[0] = color[1] = color[2] = color[3] = -1;
+        paintjob = -1;
         flags.bUpgradesUpdated = 0;
+        flags.bPreservePaintjobColor = 0;
     }
 };
 
@@ -322,6 +330,9 @@ static bool FrameIsOtherClass(RwFrame* frame)
     return false;
 }
 
+// forward — defined later with other characteristics helpers
+static void FindVehicleCharacteristicsFromNode(RwFrame* frame, CVehicle* vehicle);
+
 // ============================================================
 // Junior ProcessClassesRecursive — without '?' conditions
 // ============================================================
@@ -365,12 +376,20 @@ static void ProcessClassesRecursive(RwFrame* frame, CVehicle* vehicle, bool bSub
         string tempNodeName = GetFrameNodeName(tempNode);
         tempNodeName = tempNodeName.substr(0, 24);
 
-        // skip characteristics / conditions (not used in Light)
+        // Junior: '!' node = characteristics container (not a class option)
+        // Process all children for _pj= / _cl= etc., then skip as class candidate
         if (!tempNodeName.empty() && tempNodeName[0] == '!')
         {
+            RwFrame* tempCharacFrame = tempNode->child;
+            while (tempCharacFrame)
+            {
+                FindVehicleCharacteristicsFromNode(tempCharacFrame, vehicle);
+                tempCharacFrame = tempCharacFrame->next;
+            }
             tempNode = tempNode->next;
             continue;
         }
+        // '?' conditions not supported in Light
         if (tempNodeName.find('?') != string::npos)
         {
             tempNode = tempNode->next;
@@ -409,6 +428,9 @@ static void ProcessClassesRecursive(RwFrame* frame, CVehicle* vehicle, bool bSub
                 continue;
         }
 
+
+        // Junior: characteristics embedded in the selected class name (_pj=, _cl=, ...)
+        FindVehicleCharacteristicsFromNode(classNodes[random], vehicle);
 
         if (classNodes[random]->child)
             ProcessClassesRecursive(classNodes[random], vehicle, true);
@@ -915,10 +937,41 @@ static void FindVehicleCharacteristicsFromNode(RwFrame* frame, CVehicle* vehicle
     if (name.find('=') == string::npos)
         return;
 
-    size_t found = name.find("_cl=");
+    ExtendedData& xdata = xData.Get(vehicle);
+
+    // ---- _pj= paintjob / remap (Junior Characteristics.cpp)
+    // Forms: _pj=1  _pj=1c  _pj=0-2  _pj=0-2c
+    size_t found = name.find("_pj=");
+    if (found != string::npos && found + 4 < name.length())
+    {
+        int paintjob = 0;
+        bool preserveColor = false;
+        int digit1 = name[found + 4] - '0';
+
+        if (found + 5 < name.length() && name[found + 5] == '-')
+        {
+            int digit2 = (found + 6 < name.length()) ? (name[found + 6] - '0') : digit1;
+            srand((unsigned)(xdata.randomSeed + xdata.randomSeedUsage));
+            xdata.randomSeedUsage++;
+            paintjob = Random(digit1, digit2);
+            if (found + 7 < name.length() && name[found + 7] == 'c')
+                preserveColor = true;
+        }
+        else
+        {
+            if (found + 5 < name.length() && name[found + 5] == 'c')
+                preserveColor = true;
+            paintjob = digit1;
+        }
+
+        xdata.paintjob = (int8_t)paintjob;
+        xdata.flags.bPreservePaintjobColor = preserveColor ? 1 : 0;
+    }
+
+    // ---- _cl= colors
+    found = name.find("_cl=");
     if (found != string::npos)
     {
-        ExtendedData& xdata = xData.Get(vehicle);
         int j = 0;
         char s[32] = { 0 };
         stringstream ss(&name[found + 4]);
@@ -939,6 +992,7 @@ static void SetCharacteristicsInRender(CVehicle* vehicle)
 {
     ExtendedData& xdata = xData.Get(vehicle);
 
+    // Colors first (Junior order)
     if (xdata.color[0] >= 0)
         vehicle->m_nPrimaryColor = (uint8_t)xdata.color[0];
     if (xdata.color[1] >= 0)
@@ -947,6 +1001,19 @@ static void SetCharacteristicsInRender(CVehicle* vehicle)
         vehicle->m_nTertiaryColor = (uint8_t)xdata.color[2];
     if (xdata.color[3] >= 0)
         vehicle->m_nQuaternaryColor = (uint8_t)xdata.color[3];
+
+    // Paintjob / remap — Junior: SetRemap(paintjob - 1), optional keep color
+    if (xdata.paintjob > 0)
+    {
+        vehicle->bDontSetColourWhenRemapping = xdata.flags.bPreservePaintjobColor != 0;
+        vehicle->SetRemap((int)xdata.paintjob - 1);
+        if (vehicle->m_nRemapTxd >= 0)
+        {
+            CStreaming::RequestModel(vehicle->m_nRemapTxd + (int)txdIndexStart,
+                (int)(eStreamingFlags::KEEP_IN_MEMORY | eStreamingFlags::PRIORITY_REQUEST));
+            CStreaming::LoadAllRequestedModels(true);
+        }
+    }
 }
 
 // ============================================================
@@ -1020,6 +1087,70 @@ static void FindNodesRecursive(RwFrame* frame, CVehicle* vehicle)
 }
 
 // ============================================================
+// Junior: paintjobs on digit-terminated vehicle names
+// Wiki: [EN] Paintjobs on digit-terminated vehicles
+// Files: nrg500_1.txd, at400_2.txd, etc. (underscore before number)
+// Hook replaces game AssignRemapTxd @ call 0x5B62C2
+// ============================================================
+
+static void __cdecl CustomAssignRemapTxd(const char* txdName, uint16_t txdId)
+{
+    if (!txdName)
+        return;
+
+    size_t len = strlen(txdName);
+    if (len <= 1)
+        return;
+
+    // Only TXDs whose name ends with a digit are paintjob candidates
+    if (!isdigit((unsigned char)txdName[len - 1]))
+        return;
+
+    // Skip radar*.txd (Junior perf skip)
+    if (len >= 5 && txdName[0] == 'r' && txdName[1] == 'a' && txdName[2] == 'd'
+        && txdName[3] == 'a' && txdName[4] == 'r')
+        return;
+
+    // Strip trailing digits, and optional '_' before them:
+    //   "nrg500_1" -> "nrg500"   |  "elegy1" -> "elegy" (vanilla style still works)
+    do
+    {
+        len--;
+        if (txdName[len] == '_')
+        {
+            len--;
+            break;
+        }
+    } while (len > 0 && isdigit((unsigned char)txdName[len]));
+
+    len++; // length of model base name
+
+    char modelTxdName[32];
+    if (len >= sizeof(modelTxdName))
+        len = sizeof(modelTxdName) - 1;
+    strncpy(modelTxdName, txdName, len);
+    modelTxdName[len] = 0;
+
+    // Resolve vehicle model by TXD base name (Junior)
+    int modelId = -1;
+    CBaseModelInfo* modelInfo = CModelInfo::GetModelInfo(modelTxdName, &modelId);
+
+    if (!modelInfo)
+    {
+        uint32_t minVehModel = ReadMemory<uint32_t>(0x4C93CB + 1, true);
+        uint32_t maxVehModel = ReadMemory<uint32_t>(0x4C93C2 + 1, true);
+        modelInfo = CModelInfo::GetModelInfo(modelTxdName, (int)minVehModel, (int)maxVehModel);
+    }
+
+    // 6 = MODEL_INFO_VEHICLE (cars, bikes, trailers, …)
+    if (modelInfo && modelInfo->GetModelType() == 6)
+    {
+        CVehicleModelInfo* vehModelInfo = (CVehicleModelInfo*)modelInfo;
+        vehModelInfo->AddRemap(txdId);
+    }
+}
+
+// ============================================================
 // Plugin
 // ============================================================
 
@@ -1028,6 +1159,11 @@ class VehFuncsLight
 public:
     VehFuncsLight()
     {
+        // Junior: digit-terminated paintjobs (artict1_1.txd, nrg500_1.txd, …)
+        // MUST be at construction time — TXD remap assign runs during game load,
+        // before initScriptsEvent.
+        patch::RedirectCall(0x5B62C2, CustomAssignRemapTxd, true);
+
         // Junior: keep f_* / extra frames during hierarchy preprocess
         MakeJMP(0x004C8E30, CustomCollapseFramesCB);
 
@@ -1054,6 +1190,9 @@ public:
 
         Events::initScriptsEvent.before += []
             {
+                // Junior: TXD streaming base for paintjob remap load
+                txdIndexStart = ReadMemory<uint32_t>(0x6D65D2 + 1, true);
+
                 AtomicAlphaCallBack = ReadMemory<uintptr_t>(0x4C7842, false);
 
                 // Junior: find damage atomics walk
@@ -1119,6 +1258,8 @@ public:
                 memset(d.wheelFrame, 0, sizeof(d.wheelFrame));
                 d.spoilerFrames.clear();
                 d.color[0] = d.color[1] = d.color[2] = d.color[3] = -1;
+                d.paintjob = -1;
+                d.flags.bPreservePaintjobColor = 0;
                 d.flags.bUpgradesUpdated = 1; // apply spoiler visibility on first process
             };
 
