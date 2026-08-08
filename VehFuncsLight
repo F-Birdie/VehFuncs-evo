@@ -13,6 +13,7 @@
 #include <list>
 #include <vector>
 #include <cstring>
+#include <sstream>
 #include <cstdlib>
 
 using namespace plugin;
@@ -164,6 +165,7 @@ public:
     RwFrame* classFrame;
     RwFrame* wheelFrame[6];
     list<RwFrame*> spoilerFrames;
+    int color[4]; // -1 = leave game default
     struct {
         unsigned char bUpgradesUpdated : 1;
     } flags;
@@ -176,6 +178,7 @@ public:
         classFrame = nullptr;
         memset(wheelFrame, 0, sizeof(wheelFrame));
         spoilerFrames.clear();
+        color[0] = color[1] = color[2] = color[3] = -1;
         flags.bUpgradesUpdated = 0;
     }
 };
@@ -899,6 +902,54 @@ static void ProcessSpoiler(CVehicle* vehicle, list<RwFrame*> frames, bool after)
 }
 
 // ============================================================
+// Characteristics — only _cl= (force colors) for now
+// Junior: Characteristics.cpp FindVehicleCharacteristicsFromNode
+//         + SetCharacteristicsInRender color apply
+// ============================================================
+
+static void FindVehicleCharacteristicsFromNode(RwFrame* frame, CVehicle* vehicle)
+{
+    const string name = string(GetFrameNodeName(frame)).substr(0, 24);
+
+    // Fast reject: characteristics always use '='
+    if (name.find('=') == string::npos)
+        return;
+
+    size_t found = name.find("_cl=");
+    if (found != string::npos)
+    {
+        ExtendedData& xdata = xData.Get(vehicle);
+        int j = 0;
+        char s[32] = { 0 };
+        stringstream ss(&name[found + 4]);
+        while (j < 4 && ss.getline(s, sizeof(s), ','))
+        {
+            try {
+                xdata.color[j] = stoi(s);
+            }
+            catch (const exception&) {
+                xdata.color[j] = -1; // '-', empty, etc.
+            }
+            j++;
+        }
+    }
+}
+
+static void SetCharacteristicsInRender(CVehicle* vehicle)
+{
+    ExtendedData& xdata = xData.Get(vehicle);
+
+    if (xdata.color[0] >= 0)
+        vehicle->m_nPrimaryColor = (uint8_t)xdata.color[0];
+    if (xdata.color[1] >= 0)
+        vehicle->m_nSecondaryColor = (uint8_t)xdata.color[1];
+    if (xdata.color[2] >= 0)
+        vehicle->m_nTertiaryColor = (uint8_t)xdata.color[2];
+    if (xdata.color[3] >= 0)
+        vehicle->m_nQuaternaryColor = (uint8_t)xdata.color[3];
+}
+
+// ============================================================
 // FindNodes — Junior-style walk
 // ============================================================
 
@@ -908,6 +959,9 @@ static void FindNodesRecursive(RwFrame* frame, CVehicle* vehicle)
     {
         const string name = string(GetFrameNodeName(frame)).substr(0, 24);
         ExtendedData& xdata = xData.Get(vehicle);
+
+        // Junior: scan characteristics on every node (_cl= etc.)
+        FindVehicleCharacteristicsFromNode(frame, vehicle);
 
         if (name.length() >= 2 && name[0] == 'f' && name[1] == '_')
         {
@@ -1064,6 +1118,7 @@ public:
                 d.randomSeedUsage = 0;
                 memset(d.wheelFrame, 0, sizeof(d.wheelFrame));
                 d.spoilerFrames.clear();
+                d.color[0] = d.color[1] = d.color[2] = d.color[3] = -1;
                 d.flags.bUpgradesUpdated = 1; // apply spoiler visibility on first process
             };
 
@@ -1084,6 +1139,9 @@ public:
                     // Junior: apply variable wheels after node walk
                     if (d.wheelFrame[0])
                         SetWheel(d.wheelFrame, vehicle);
+
+                    // Junior: apply _cl= colors once
+                    SetCharacteristicsInRender(vehicle);
 
                     d.nodesProcess = false;
                     d.flags.bUpgradesUpdated = 1; // first-time spoiler visibility
