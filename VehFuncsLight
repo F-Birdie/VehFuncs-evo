@@ -1,5 +1,5 @@
 /*
- * VehFuncs Light — f_class + f_extras + variable wheels
+ * VehFuncs Light — f_class + f_extras + variable wheels + f_spoiler
  * Logic taken from Junior_Djjr VehFuncs (RecursiveExtras / collapse / wheels)
  * https://github.com/JuniorDjjr/VehFuncs
  */
@@ -163,6 +163,10 @@ public:
     int randomSeedUsage;
     RwFrame* classFrame;
     RwFrame* wheelFrame[6];
+    list<RwFrame*> spoilerFrames;
+    struct {
+        unsigned char bUpgradesUpdated : 1;
+    } flags;
 
     ExtendedData(CVehicle*)
     {
@@ -171,6 +175,8 @@ public:
         randomSeedUsage = 0;
         classFrame = nullptr;
         memset(wheelFrame, 0, sizeof(wheelFrame));
+        spoilerFrames.clear();
+        flags.bUpgradesUpdated = 0;
     }
 };
 
@@ -834,6 +840,65 @@ static void __declspec(naked) NeverRender()
 }
 
 // ============================================================
+// Junior f_spoiler — hide when spoiler upgrade (slot 6) is installed
+// (no speed animation; that is separate f_an logic we skip)
+// ============================================================
+
+static RwFrame* HideAllNodesRecursive_Forced(RwFrame* frame, bool isRoot)
+{
+    FRAME_EXTENSION(frame)->flags.bNeverRender = true;
+    if (RwFrame* nextFrame = frame->child)
+        HideAllNodesRecursive_Forced(nextFrame, false);
+    if (!isRoot)
+        if (RwFrame* nextFrame = frame->next)
+            HideAllNodesRecursive_Forced(nextFrame, false);
+    return frame;
+}
+
+static RwFrame* ShowAllNodesRecursive_Forced(RwFrame* frame, bool isRoot)
+{
+    FRAME_EXTENSION(frame)->flags.bNeverRender = false;
+    if (RwFrame* nextFrame = frame->child)
+        ShowAllNodesRecursive_Forced(nextFrame, false);
+    if (!isRoot)
+        if (RwFrame* nextFrame = frame->next)
+            ShowAllNodesRecursive_Forced(nextFrame, false);
+    return frame;
+}
+
+// Junior Spoiler.cpp — exact (tuning hide only)
+static void ProcessSpoiler(CVehicle* vehicle, list<RwFrame*> frames, bool after)
+{
+    if (frames.empty())
+        return;
+
+    bool visible = true;
+
+    if (vehicle->GetUpgrade(6) > 0) // spoiler upgrade slot
+    {
+        visible = false;
+    }
+    else
+    {
+        if (after)
+            visible = true;
+        else
+            return;
+    }
+
+    for (RwFrame* frame : frames)
+    {
+        if (frame->object.parent && FRAME_EXTENSION(frame)->owner == vehicle)
+        {
+            if (!visible)
+                HideAllNodesRecursive_Forced(frame, true);
+            else
+                ShowAllNodesRecursive_Forced(frame, true);
+        }
+    }
+}
+
+// ============================================================
 // FindNodes — Junior-style walk
 // ============================================================
 
@@ -882,6 +947,13 @@ static void FindNodesRecursive(RwFrame* frame, CVehicle* vehicle)
                         break;
                     }
                 }
+            }
+
+            // f_spoiler — hide when tuning spoiler installed
+            if (name.find("f_spoiler") != string::npos)
+            {
+                xdata.spoilerFrames.push_back(frame);
+                FRAME_EXTENSION(frame)->owner = vehicle;
             }
         }
 
@@ -956,6 +1028,21 @@ public:
                         RwFrame* frame = (RwFrame*)regs.edi;
                         FRAME_EXTENSION(frame)->flags.bDestroyOnRemoveUpgrade = true;
                     });
+
+                // Junior: mark upgrades updated (spoiler hide/show)
+                MakeInline<0x006E32AB, 0x006E32AB + 8>([](reg_pack& regs)
+                    {
+                        *(uint32_t*)(regs.esp + 0x14) = 0xFFFFFFFF;
+                        CVehicle* veh = (CVehicle*)regs.edi;
+                        xData.Get(veh).flags.bUpgradesUpdated = 1;
+                    });
+                MakeInline<0x006DF96C, 0x006DF96C + 6>([](reg_pack& regs)
+                    {
+                        regs.eax = *(uint16_t*)(regs.esi + 0x12);
+                        regs.esi = regs.eax;
+                        CVehicle* veh = (CVehicle*)regs.edi;
+                        xData.Get(veh).flags.bUpgradesUpdated = 1;
+                    });
             };
 
         // Junior: restore collapse call-site if IVF (or similar) redirected it
@@ -976,26 +1063,46 @@ public:
                     d.randomSeed = rand();
                 d.randomSeedUsage = 0;
                 memset(d.wheelFrame, 0, sizeof(d.wheelFrame));
+                d.spoilerFrames.clear();
+                d.flags.bUpgradesUpdated = 1; // apply spoiler visibility on first process
             };
 
         Events::vehicleRenderEvent.before += [](CVehicle* vehicle)
             {
                 if (!vehicle || !vehicle->m_pRwClump) return;
                 ExtendedData& d = xData.Get(vehicle);
-                if (!d.nodesProcess) return;
 
-                getClassList().clear();
-                d.randomSeedUsage = 0;
+                if (d.nodesProcess)
+                {
+                    getClassList().clear();
+                    d.randomSeedUsage = 0;
 
-                RwFrame* root = (RwFrame*)vehicle->m_pRwClump->object.parent;
-                if (root)
-                    FindNodesRecursive(root, vehicle);
+                    RwFrame* root = (RwFrame*)vehicle->m_pRwClump->object.parent;
+                    if (root)
+                        FindNodesRecursive(root, vehicle);
 
-                // Junior: apply variable wheels after node walk
-                if (d.wheelFrame[0])
-                    SetWheel(d.wheelFrame, vehicle);
+                    // Junior: apply variable wheels after node walk
+                    if (d.wheelFrame[0])
+                        SetWheel(d.wheelFrame, vehicle);
 
-                d.nodesProcess = false;
+                    d.nodesProcess = false;
+                    d.flags.bUpgradesUpdated = 1; // first-time spoiler visibility
+                }
+
+                // Junior: hide f_spoiler when tuning spoiler is installed
+                if (d.flags.bUpgradesUpdated)
+                    ProcessSpoiler(vehicle, d.spoilerFrames, false);
+            };
+
+        Events::vehicleRenderEvent.after += [](CVehicle* vehicle)
+            {
+                if (!vehicle) return;
+                ExtendedData& d = xData.Get(vehicle);
+                if (d.flags.bUpgradesUpdated)
+                {
+                    ProcessSpoiler(vehicle, d.spoilerFrames, true);
+                    d.flags.bUpgradesUpdated = 0;
+                }
             };
     }
 } vehFuncsLight;
