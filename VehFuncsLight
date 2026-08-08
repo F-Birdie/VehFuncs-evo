@@ -217,10 +217,11 @@ public:
     int randomSeedUsage;
     RwFrame* classFrame;
     RwFrame* wheelFrame[6];
+    RwFrame* hitchFrame;           // <-- add this
     list<RwFrame*> spoilerFrames;
-    int color[4]; // -1 = leave game default
-    int8_t paintjob; // -1 = none, 1..N = remap (Junior stores 1-based)
-    RwFrame* popupFrame[2]; // [0]=f_popl [1]=f_popr
+    int color[4];
+    int8_t paintjob;
+    RwFrame* popupFrame[2];
     float popupProgress[2];
     struct {
         unsigned char bUpgradesUpdated : 1;
@@ -234,6 +235,7 @@ public:
         randomSeedUsage = 0;
         classFrame = nullptr;
         memset(wheelFrame, 0, sizeof(wheelFrame));
+        hitchFrame = nullptr;      // <-- add this
         spoilerFrames.clear();
         color[0] = color[1] = color[2] = color[3] = -1;
         paintjob = -1;
@@ -251,6 +253,95 @@ static list<string>& getClassList()
     static list<string> classList;
     return classList;
 }
+
+// ============================================================
+// Junior Hitch (by Fabio) — custom tow-bar attach point via f_hitch
+// VMT hook on CAutomobile::GetTowBarPos / CTrailer::GetTowBarPos
+// ============================================================
+
+typedef bool(__thiscall* GetTowBarPos_t)(CAutomobile* ths, RwV3d* point, char a3, CAutomobile* a4);
+
+namespace Hitch
+{
+    static GetTowBarPos_t GetTowBarPosOriginal = nullptr;
+    static GetTowBarPos_t GetTowBarPosOriginal_Trailer = nullptr;
+
+    static CAutomobile* veh = nullptr;
+    static RwV3d* p = nullptr;
+    static char a0 = 0;
+    static CAutomobile* a1 = nullptr;
+    static int result = 0;
+
+    static bool isCustomCar(CAutomobile* mob, RwV3d& point)
+    {
+        ExtendedData& xdata = xData.Get(mob);
+        if (xdata.hitchFrame == nullptr) return false;
+
+        RpAtomic* atomic = (RpAtomic*)GetFirstObject(xdata.hitchFrame);
+        if (atomic)
+        {
+            if (atomic->object.object.flags & 0x4) {}
+            else return false; // atomic exists but isn't visible - fall back to original
+        }
+
+        RwMatrix* matrix = RwFrameGetLTM(xdata.hitchFrame);
+
+        point.x = matrix->pos.x;
+        point.y = matrix->pos.y;
+        point.z = matrix->pos.z;
+        return true;
+    }
+
+    static bool GetTowBarPos(CAutomobile* thisA, RwV3d* point, char a3, CAutomobile* a4)
+    {
+        RwV3d pp;
+
+        if (isCustomCar(thisA, pp))
+        {
+            *point = pp;
+            return true;
+        }
+
+        if (thisA->m_nVehicleSubClass != VEHICLE_TRAILER)
+            return GetTowBarPosOriginal(thisA, point, a3, a4);
+        else
+            return GetTowBarPosOriginal_Trailer(thisA, point, a3, a4);
+    }
+
+    static void wrapper()
+    {
+        result = GetTowBarPos(veh, p, a0, a1);
+    }
+
+    static void __declspec(naked) GetTowBarPosToHook()
+    {
+        __asm
+        {
+            mov veh, ecx
+            mov eax, [esp + 4]
+            mov p, eax
+
+            mov al, [esp + 8]
+            mov a0, al
+
+            mov eax, [esp + 12]
+            mov a1, eax
+
+            pushad
+            pushfd
+
+            call wrapper
+
+            popfd
+            popad
+
+            mov eax, result
+
+            retn 0xC
+        }
+    }
+}
+
 
 // ============================================================
 // Junior CustomCollapseFramesCB / CustomMoveObjectsCB — exact
@@ -1311,6 +1402,13 @@ static void FindNodesRecursive(RwFrame* frame, CVehicle* vehicle)
                 FRAME_EXTENSION(frame)->owner = vehicle;
             }
 
+            // Functional hitch
+            if (name.find("f_hitch") != string::npos)
+            {
+                xdata.hitchFrame = frame;
+                FRAME_EXTENSION(frame)->owner = vehicle;
+            }
+
             // Popup headlights — f_popl (left/0) / f_popr (right/1)
             if (name.find("f_pop") != string::npos)
             {
@@ -1413,6 +1511,16 @@ public:
 
         // Junior: keep f_* / extra frames during hierarchy preprocess
         MakeJMP(0x004C8E30, CustomCollapseFramesCB);
+
+        // Junior: Hitch — CAutomobile
+        int* vmt = (int*)0x00871120;
+        int* getlink = vmt + (0xF0 / sizeof(vmt));
+        Hitch::GetTowBarPosOriginal = (GetTowBarPos_t)ReadMemory<int*>(getlink, true);
+        WriteMemory(getlink, memory_pointer(Hitch::GetTowBarPosToHook).as_int(), true);
+
+        // Junior: Hitch — CTrailer
+        Hitch::GetTowBarPosOriginal_Trailer = (GetTowBarPos_t)ReadMemory<int*>(0x871D18, true);
+        WriteMemory(0x871D18, memory_pointer(Hitch::GetTowBarPosToHook).as_int(), true);
 
         // Junior: ug_dummy hierarchy id fix
         MakeInline<0x004C8FA1, 0x004C8FA1 + 6>([](reg_pack& regs)
@@ -1538,13 +1646,14 @@ public:
                     d.randomSeed = rand();
                 d.randomSeedUsage = 0;
                 memset(d.wheelFrame, 0, sizeof(d.wheelFrame));
+                d.hitchFrame = nullptr;   // <-- add this
                 d.spoilerFrames.clear();
                 d.color[0] = d.color[1] = d.color[2] = d.color[3] = -1;
                 d.paintjob = -1;
                 d.popupFrame[0] = d.popupFrame[1] = nullptr;
                 d.popupProgress[0] = d.popupProgress[1] = 0.0f;
                 d.flags.bPreservePaintjobColor = 0;
-                d.flags.bUpgradesUpdated = 1; // apply spoiler visibility on first process
+                d.flags.bUpgradesUpdated = 1;
             };
 
         Events::vehicleRenderEvent.before += [](CVehicle* vehicle)
