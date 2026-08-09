@@ -510,8 +510,15 @@ static void ProcessClassesRecursive(RwFrame* frame, CVehicle* vehicle, bool bSub
     if (found != string::npos && name.length() > found)
     {
         selectVariations = stoi(&name[found + 1]);
-        if (found + 2 < name.length() && name[found + 2] == '+')
-            randomizeVariations = true;
+        int i = 0;
+        do {
+            if (name.length() > (found + 1 + i))
+            {
+                if (name[found + 2 + i] == '+')
+                    randomizeVariations = true;
+            }
+            i++;
+        } while (i <= 1);
     }
 
     int totalClass = 0;
@@ -903,6 +910,7 @@ static void SetWheel(RwFrame* frame[6], CVehicle* vehicle)
             if (frame[j]->child)
                 DestroyNodeHierarchyRecursive(frame[j]->child);
             RwFrameDestroy(frame[j]);
+            frame[j] = nullptr;   // add this
             continue;
         }
 
