@@ -238,7 +238,10 @@ public:
     list<RwFrame*> spoilerFrames;
     list<RwFrame*> gearFrame;      // f_gear / f_spin
     list<RwFrame*> fanFrame;       // f_fan
+    list<RwFrame*> gaspedalFrame;  // f_gas
+    list<RwFrame*> brakepedalFrame;// f_brake
     float smoothGasPedal;          // drives f_gear rotation speed
+    float smoothBrakePedal;        // drives f_brake pedal travel
     int color[4];
     int8_t paintjob;
     RwFrame* popupFrame[2];
@@ -259,7 +262,10 @@ public:
         spoilerFrames.clear();
         gearFrame.clear();
         fanFrame.clear();
+        gaspedalFrame.clear();
+        brakepedalFrame.clear();
         smoothGasPedal = 0.0f;
+        smoothBrakePedal = 0.0f;
         color[0] = color[1] = color[2] = color[3] = -1;
         paintjob = -1;
         popupFrame[0] = popupFrame[1] = nullptr;
@@ -805,7 +811,7 @@ static void ProcessExtraRecursive(RwFrame* frame, CVehicle* vehicle)
 // Junior GearAndFan.cpp — exact (f_gear / f_spin + f_fan)
 // ============================================================
 
-void ProcessRotatePart(CVehicle* vehicle, list<RwFrame*> frames, bool isGear)  // by value
+static void ProcessRotatePart(CVehicle* vehicle, list<RwFrame*> frames, bool isGear)
 {
     for (RwFrame* frame : frames)
     {
@@ -844,6 +850,64 @@ void ProcessRotatePart(CVehicle* vehicle, list<RwFrame*> frames, bool isGear)  /
             ExtendedData& xdata = xData.Get(vehicle);
             if (isGear) xdata.gearFrame.remove(frame);
             else xdata.fanFrame.remove(frame);
+        }
+    }
+}
+
+// ============================================================
+// Junior Pedal.cpp — exact (f_gas / f_brake)
+// mode: 1 = gas, else = brake
+// ============================================================
+
+static void ProcessPedal(CVehicle* vehicle, list<RwFrame*> frames, int mode)
+{
+    for (RwFrame* frame : frames)
+    {
+        if (frame->object.parent && FRAME_EXTENSION(frame)->owner == vehicle)
+        {
+            RestoreMatrixBackup(&frame->modelling, (MatrixBackup*)FRAME_EXTENSION(frame)->origMatrix);
+            if (vehicle->bEngineOn && vehicle->m_fHealth > 0 && !vehicle->bEngineBroken && !vehicle->bIsDrowning)
+            {
+                ExtendedData& xdata = xData.Get(vehicle);
+                const string name = GetFrameNodeName(frame);
+                size_t found;
+                float angle = 0.0f;
+                float pedal;
+                if (mode == 1)
+                    pedal = xdata.smoothGasPedal;
+                else
+                    pedal = xdata.smoothBrakePedal;
+
+                // Find axis
+                found = name.find("_ax=");
+                if (found != string::npos)
+                {
+                    float angleX = stof(&name[found + 4]);
+                    angle = 0.0f + pedal * angleX;
+                    RwFrameRotate(frame, (RwV3d*)0x008D2E00, angle, rwCOMBINEPRECONCAT);
+                }
+                found = name.find("_ay=");
+                if (found != string::npos)
+                {
+                    float angleZ = stof(&name[found + 4]);
+                    angle = 0.0f + pedal * angleZ;
+                    RwFrameRotate(frame, (RwV3d*)0x008D2E0C, angle, rwCOMBINEPRECONCAT);
+                }
+                found = name.find("_az=");
+                if (found != string::npos)
+                {
+                    float angleZ = stof(&name[found + 4]);
+                    angle = 0.0f + pedal * angleZ;
+                    RwFrameRotate(frame, (RwV3d*)0x008D2E18, angle, rwCOMBINEPRECONCAT);
+                }
+            }
+            RwFrameUpdateObjects(frame);
+        }
+        else
+        {
+            ExtendedData& xdata = xData.Get(vehicle);
+            if (mode == 1) xdata.gaspedalFrame.remove(frame);
+            else xdata.brakepedalFrame.remove(frame);
         }
     }
 }
@@ -1510,6 +1574,26 @@ static void FindNodesRecursive(RwFrame* frame, CVehicle* vehicle)
                 FRAME_EXTENSION(frame)->owner = vehicle;
             }
 
+            // Gaspedal
+            if (name.find("f_gas") != string::npos)
+            {
+                if (CreateMatrixBackup(frame))
+                {
+                    xdata.gaspedalFrame.push_back(frame);
+                    FRAME_EXTENSION(frame)->owner = vehicle;
+                }
+            }
+
+            // Brakepedal
+            if (name.find("f_brake") != string::npos)
+            {
+                if (CreateMatrixBackup(frame))
+                {
+                    xdata.brakepedalFrame.push_back(frame);
+                    FRAME_EXTENSION(frame)->owner = vehicle;
+                }
+            }
+
             // Popup headlights — f_popl (left/0) / f_popr (right/1)
             if (name.find("f_pop") != string::npos)
             {
@@ -1751,7 +1835,10 @@ public:
                 d.spoilerFrames.clear();
                 d.gearFrame.clear();
                 d.fanFrame.clear();
+                d.gaspedalFrame.clear();
+                d.brakepedalFrame.clear();
                 d.smoothGasPedal = 0.0f;
+                d.smoothBrakePedal = 0.0f;
                 d.color[0] = d.color[1] = d.color[2] = d.color[3] = -1;
                 d.paintjob = -1;
                 d.popupFrame[0] = d.popupFrame[1] = nullptr;
@@ -1825,12 +1912,35 @@ public:
                     }
                 }
 
+                // Junior: smooth brake pedal (drives f_brake pedal travel)
+                {
+                    float brakePedal = abs(vehicle->m_fBreakPedal);
+                    if (brakePedal > 0.0f)
+                    {
+                        d.smoothBrakePedal += (CTimer::ms_fTimeStep / 1.6666f) * (brakePedal / 6.0f);
+                        if (d.smoothBrakePedal > 1.0f) d.smoothBrakePedal = 1.0f;
+                        else if (d.smoothBrakePedal > brakePedal) d.smoothBrakePedal = brakePedal;
+                    }
+                    else
+                    {
+                        if (d.smoothBrakePedal > 0.0f)
+                        {
+                            d.smoothBrakePedal -= (CTimer::ms_fTimeStep / 1.6666f) * 0.3f;
+                            if (d.smoothBrakePedal < 0.0f) d.smoothBrakePedal = 0.0f;
+                        }
+                    }
+                }
+
                 // Junior: rotate gear/fan while engine is running
                 if (vehicle->bEngineOn)
                 {
                     if (!d.gearFrame.empty()) ProcessRotatePart(vehicle, d.gearFrame, true);
                     if (!d.fanFrame.empty()) ProcessRotatePart(vehicle, d.fanFrame, false);
                 }
+
+                // Junior: gas / brake pedal travel
+                if (!d.gaspedalFrame.empty()) ProcessPedal(vehicle, d.gaspedalFrame, 1);
+                if (!d.brakepedalFrame.empty()) ProcessPedal(vehicle, d.brakepedalFrame, 2);
 
                 // Junior: popup headlights (every frame while frames exist)
                 if (d.popupFrame[0] || d.popupFrame[1])
