@@ -1,6 +1,6 @@
 /*
- * VehFuncs Light — f_class + f_extras + variable wheels + f_spoiler + _cl= + _pj=
- * Logic taken from Junior_Djjr VehFuncs (RecursiveExtras / collapse / wheels)
+ * VehFuncs Light — f_class + f_extras + variable wheels + f_spoiler + _cl= + _pj= + f_hitch + f_gear/f_fan
+ * Logic taken from Junior_Djjr VehFuncs (RecursiveExtras / collapse / wheels / GearAndFan)
  * https://github.com/JuniorDjjr/VehFuncs
  */
 #include "plugin.h"
@@ -186,6 +186,23 @@ static int Random(int min, int max)
 }
 
 // ============================================================
+// Junior GetVehicleSpeedRealistic (Utilities.cpp) — simplified.
+// Needed by the gas-pedal smoothing that drives f_gear speed.
+// Junior's original had CBike/CAutomobile wheel-speed branches, but the
+// return value is only ever consumed downstream for the PLANE/HELI branch
+// of gas-pedal smoothing (cars/bikes compute smoothGasPedal straight from
+// m_fGasPedal and never touch this). Planes/helis fall into the generic
+// velocity-magnitude case anyway, so the wheel-speed branches were dead
+// code for this port and are dropped here to avoid depending on CBike/
+// CAutomobile member names that don't exist in this plugin-sdk build.
+// ============================================================
+
+static float GetVehicleSpeedRealistic(CVehicle* vehicle)
+{
+    return (vehicle->m_vecMoveSpeed.Magnitude() * 50.0f) * 3.6f;
+}
+
+// ============================================================
 // Junior DestroyNodeHierarchyRecursive (Utilities.cpp) — exact
 // ============================================================
 
@@ -217,8 +234,11 @@ public:
     int randomSeedUsage;
     RwFrame* classFrame;
     RwFrame* wheelFrame[6];
-    RwFrame* hitchFrame;           // <-- add this
+    RwFrame* hitchFrame;
     list<RwFrame*> spoilerFrames;
+    list<RwFrame*> gearFrame;      // f_gear / f_spin
+    list<RwFrame*> fanFrame;       // f_fan
+    float smoothGasPedal;          // drives f_gear rotation speed
     int color[4];
     int8_t paintjob;
     RwFrame* popupFrame[2];
@@ -235,8 +255,11 @@ public:
         randomSeedUsage = 0;
         classFrame = nullptr;
         memset(wheelFrame, 0, sizeof(wheelFrame));
-        hitchFrame = nullptr;      // <-- add this
+        hitchFrame = nullptr;
         spoilerFrames.clear();
+        gearFrame.clear();
+        fanFrame.clear();
+        smoothGasPedal = 0.0f;
         color[0] = color[1] = color[2] = color[3] = -1;
         paintjob = -1;
         popupFrame[0] = popupFrame[1] = nullptr;
@@ -709,13 +732,11 @@ static void ProcessExtraRecursive(RwFrame* frame, CVehicle* vehicle)
         extraFrames[(frames + 1)] = (RwFrame*)1;
         extraFramesMatchClass[(classFrames + 1)] = (RwFrame*)1;
 
-        if (classFrames > 0)
-
-            if (selectVariations == -1)
-            {
-                if (frames == 1) selectVariations = 0;
-                else selectVariations = 1;
-            }
+        if (selectVariations == -1)
+        {
+            if (frames == 1) selectVariations = 0;
+            else selectVariations = 1;
+        }
 
         int i = 0;
         int random = 0;
@@ -776,6 +797,53 @@ static void ProcessExtraRecursive(RwFrame* frame, CVehicle* vehicle)
             if (extraFrames[j] == (RwFrame*)1) break;
             if (extraFrames[j] != nullptr && extraFrames[j] != 0)
                 DestroyNodeHierarchyRecursive(extraFrames[j]);
+        }
+    }
+}
+
+// ============================================================
+// Junior GearAndFan.cpp — exact (f_gear / f_spin + f_fan)
+// ============================================================
+
+void ProcessRotatePart(CVehicle* vehicle, list<RwFrame*> frames, bool isGear)  // by value
+{
+    for (RwFrame* frame : frames)
+    {
+        if (frame->object.parent && FRAME_EXTENSION(frame)->owner == vehicle)
+        {
+            const string name = GetFrameNodeName(frame);
+            float speedMult = 0.0f + CTimer::ms_fTimeStep * 22.0f;
+            size_t found;
+
+            found = name.find("_mu=");
+            if (found != string::npos)
+            {
+                float mult = stof(&name[found + 4]);
+                speedMult *= mult;
+            }
+
+            if (isGear == true)
+            {
+                ExtendedData& xdata = xData.Get(vehicle);
+                speedMult += CTimer::ms_fTimeStep * abs(xdata.smoothGasPedal * 13.0f);
+            }
+
+            RwV3d* axis = (RwV3d*)0x008D2E0C; // y (default)
+            found = name.find("_x");
+            if (found != string::npos)
+                axis = (RwV3d*)0x008D2E00;
+            found = name.find("_z");
+            if (found != string::npos)
+                axis = (RwV3d*)0x008D2E18;
+
+            RwFrameRotate(frame, axis, speedMult, rwCOMBINEPRECONCAT);
+            RwFrameUpdateObjects(frame);
+        }
+        else
+        {
+            ExtendedData& xdata = xData.Get(vehicle);
+            if (isGear) xdata.gearFrame.remove(frame);
+            else xdata.fanFrame.remove(frame);
         }
     }
 }
@@ -910,7 +978,7 @@ static void SetWheel(RwFrame* frame[6], CVehicle* vehicle)
             if (frame[j]->child)
                 DestroyNodeHierarchyRecursive(frame[j]->child);
             RwFrameDestroy(frame[j]);
-            frame[j] = nullptr;   // add this
+            frame[j] = nullptr;
             continue;
         }
 
@@ -1417,6 +1485,31 @@ static void FindNodesRecursive(RwFrame* frame, CVehicle* vehicle)
                 FRAME_EXTENSION(frame)->owner = vehicle;
             }
 
+            // Gear (or spin, for planes/helis)
+            if (vehicle->m_nVehicleSubClass == VEHICLE_PLANE || vehicle->m_nVehicleSubClass == VEHICLE_HELI)
+            {
+                if (name.find("f_spin") != string::npos)
+                {
+                    xdata.gearFrame.push_back(frame);
+                    FRAME_EXTENSION(frame)->owner = vehicle;
+                }
+            }
+            else
+            {
+                if (name.find("f_gear") != string::npos)
+                {
+                    xdata.gearFrame.push_back(frame);
+                    FRAME_EXTENSION(frame)->owner = vehicle;
+                }
+            }
+
+            // Fan
+            if (name.find("f_fan") != string::npos)
+            {
+                xdata.fanFrame.push_back(frame);
+                FRAME_EXTENSION(frame)->owner = vehicle;
+            }
+
             // Popup headlights — f_popl (left/0) / f_popr (right/1)
             if (name.find("f_pop") != string::npos)
             {
@@ -1654,8 +1747,11 @@ public:
                     d.randomSeed = rand();
                 d.randomSeedUsage = 0;
                 memset(d.wheelFrame, 0, sizeof(d.wheelFrame));
-                d.hitchFrame = nullptr;   // <-- add this
+                d.hitchFrame = nullptr;
                 d.spoilerFrames.clear();
+                d.gearFrame.clear();
+                d.fanFrame.clear();
+                d.smoothGasPedal = 0.0f;
                 d.color[0] = d.color[1] = d.color[2] = d.color[3] = -1;
                 d.paintjob = -1;
                 d.popupFrame[0] = d.popupFrame[1] = nullptr;
@@ -1687,6 +1783,53 @@ public:
 
                     d.nodesProcess = false;
                     d.flags.bUpgradesUpdated = 1; // first-time spoiler visibility
+                }
+
+                // Junior: smooth gas pedal (drives f_gear speed)
+                {
+                    float realisticSpeed = GetVehicleSpeedRealistic(vehicle);
+                    int subClass = vehicle->m_nVehicleSubClass;
+
+                    int gasSoundProgress = vehicle->m_vehicleAudio.field_14C;
+                    int rpmSound = vehicle->m_vehicleAudio.field_148;
+
+                    if ((subClass == VEHICLE_AUTOMOBILE || subClass == VEHICLE_BIKE || subClass == VEHICLE_MTRUCK || subClass == VEHICLE_QUAD) &&
+                        gasSoundProgress == 0 && vehicle->m_fMovingSpeed > 0.2f && rpmSound != -1)
+                    {
+                        d.smoothGasPedal = 0.0f;
+                    }
+                    else
+                    {
+                        float gasPedal = abs(vehicle->m_fGasPedal);
+
+                        if (subClass == VEHICLE_PLANE || subClass == VEHICLE_HELI)
+                        {
+                            gasPedal = realisticSpeed / 40.0f;
+                            if (gasPedal > 1.0f) gasPedal = 1.0f;
+                        }
+
+                        if (gasPedal > 0.0f)
+                        {
+                            d.smoothGasPedal += (CTimer::ms_fTimeStep / 1.6666f) * (gasPedal / 6.0f);
+                            if (d.smoothGasPedal > 1.0f) d.smoothGasPedal = 1.0f;
+                            else if (d.smoothGasPedal > gasPedal) d.smoothGasPedal = gasPedal;
+                        }
+                        else
+                        {
+                            if (d.smoothGasPedal > 0.0f)
+                            {
+                                d.smoothGasPedal -= (CTimer::ms_fTimeStep / 1.6666f) * 0.3f;
+                                if (d.smoothGasPedal < 0.0f) d.smoothGasPedal = 0.0f;
+                            }
+                        }
+                    }
+                }
+
+                // Junior: rotate gear/fan while engine is running
+                if (vehicle->bEngineOn)
+                {
+                    if (!d.gearFrame.empty()) ProcessRotatePart(vehicle, d.gearFrame, true);
+                    if (!d.fanFrame.empty()) ProcessRotatePart(vehicle, d.fanFrame, false);
                 }
 
                 // Junior: popup headlights (every frame while frames exist)
