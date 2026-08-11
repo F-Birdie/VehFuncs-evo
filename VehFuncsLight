@@ -1052,94 +1052,64 @@ static void SetWheel(RwFrame* frame[6], CVehicle* vehicle)
 }
 
 // ============================================================
-// Upgrade ForAllChildren — native callback for everything EXCEPT
-// variable-wheel (bIsVarWheel) subtrees.
-//
-// Why hook again at all?
-//   Previewing a tuning wheel runs the game's upgrade walk, which
-//   destroys atomics on the wheel node — including our f_wheel clones.
-//   Cancel then restores only the stock SA wheel, never the clones.
-//   Junior avoided that by owning this walk. We can't skip the hook
-//   for wheels, but we MUST still run the game's callback for exhaust
-//   etc. or those break again.
-//
-// Strategy:
-//   Reimplement ForAllChildren ourselves:
-//     - if subtree has bIsVarWheel → only NeverRender hide/show (keep meshes)
-//     - else → call the game's original callback (native exhaust/etc.)
-//   Never call through a resolved RwFrameForAllChildren pointer (that
-//   path crashed on exhaust install).
+// Upgrade add/remove — ONLY touch variable-wheel clones (bIsVarWheel).
+// Full Junior path also walks fog/exhaust upgrade trees with RemoveObjectsCB;
+// that was crashing on cancel-preview for non-wheel upgrades.
 // ============================================================
 
-static bool SubtreeHasVarWheel(RwFrame* frame)
+static RpAtomic* __cdecl SafeRemoveAtomicCB(RpAtomic* atomic, void* data)
 {
-    if (!frame) return false;
+    (void)data;
+    if (!atomic) return nullptr;
+    if (atomic->clump)
+        RpClumpRemoveAtomic(atomic->clump, atomic);
+    RpAtomicDestroy(atomic);
+    return nullptr;
+}
+
+static RwFrame* __cdecl CustomRwFrameForAllChildren_AddUpgrade_Recurse(RwFrame* frame, void* data)
+{
+    (void)data;
+    // Only hide variable-wheel clones — do not touch fog/exhaust/other frames
     if (FRAME_EXTENSION(frame)->flags.bIsVarWheel)
-        return true;
-    for (RwFrame* c = frame->child; c; c = c->next)
-    {
-        if (SubtreeHasVarWheel(c))
-            return true;
-    }
-    return false;
-}
+        FRAME_EXTENSION(frame)->flags.bNeverRender = true;
 
-static void SetVarWheelNeverRenderRecursive(RwFrame* frame, bool hide)
-{
-    if (!frame) return;
-    if (FRAME_EXTENSION(frame)->flags.bIsVarWheel)
-        FRAME_EXTENSION(frame)->flags.bNeverRender = hide;
-    if (RwFrame* c = frame->child) SetVarWheelNeverRenderRecursive(c, hide);
-    if (RwFrame* n = frame->next)  SetVarWheelNeverRenderRecursive(n, hide);
-}
-
-static void UpdateVarWheelVisibility(CVehicle* vehicle)
-{
-    if (!vehicle) return;
-    ExtendedData& xdata = xData.Get(vehicle);
-    bool hasTuningWheel = CVehicle__GetReplacementUpgrade(vehicle, 2) != -1;
-    for (int i = 0; i < 6; i++)
-    {
-        if (xdata.wheelFrame[i])
-            SetVarWheelNeverRenderRecursive(xdata.wheelFrame[i], hasTuningWheel);
-    }
-}
-
-// Walk direct children only (same as RwFrameForAllChildren).
-// Var-wheel subtrees: NeverRender only. Everything else: game callback.
-static RwFrame* __cdecl CustomRwFrameForAllChildren_AddUpgrade(RwFrame* frame, RwFrameCallBack callback, void* data)
-{
-    if (!frame)
-        return frame;
-
-    RwFrame* child = frame->child;
-    while (child)
-    {
-        RwFrame* next = child->next; // callback may unlink
-        if (SubtreeHasVarWheel(child))
-            SetVarWheelNeverRenderRecursive(child, true);
-        else if (callback)
-            callback(child, data);
-        child = next;
-    }
+    if (RwFrame* c = frame->child)
+        CustomRwFrameForAllChildren_AddUpgrade_Recurse(c, data);
+    if (RwFrame* n = frame->next)
+        CustomRwFrameForAllChildren_AddUpgrade_Recurse(n, data);
     return frame;
 }
 
-static RwFrame* __cdecl CustomRwFrameForAllChildren_RemoveUpgrade(RwFrame* frame, RwFrameCallBack callback, void* data)
+static RwFrame* __cdecl CustomRwFrameForAllChildren_AddUpgrade(RwFrame* frame, RwFrame* (__cdecl* callback)(RwFrame*, void*), void* data)
 {
-    if (!frame)
-        return frame;
+    (void)callback;
+    if (RwFrame* c = frame->child)
+        CustomRwFrameForAllChildren_AddUpgrade_Recurse(c, data);
+    return frame;
+}
 
-    RwFrame* child = frame->child;
-    while (child)
+static RwFrame* __cdecl CustomRwFrameForAllChildren_RemoveUpgrade_Recurse(RwFrame* frame, void* data)
+{
+    if (FRAME_EXTENSION(frame)->flags.bDestroyOnRemoveUpgrade)
     {
-        RwFrame* next = child->next;
-        if (SubtreeHasVarWheel(child))
-            SetVarWheelNeverRenderRecursive(child, false);
-        else if (callback)
-            callback(child, data);
-        child = next;
+        // Upgrade-owned meshes: strip atomics safely (data may be clump; use atomic->clump)
+        RwFrameForAllObjects(frame, (RwObjectCallBack)SafeRemoveAtomicCB, data);
     }
+    else if (FRAME_EXTENSION(frame)->flags.bIsVarWheel)
+    {
+        // Show variable wheels again after cancel / remove upgrade
+        FRAME_EXTENSION(frame)->flags.bNeverRender = false;
+    }
+
+    RwFrameForAllChildren(frame, CustomRwFrameForAllChildren_RemoveUpgrade_Recurse, data);
+    return frame;
+}
+
+static RwFrame* __cdecl CustomRwFrameForAllChildren_RemoveUpgrade(RwFrame* frame, RwFrame* (__cdecl* callback)(RwFrame*, void*), void* data)
+{
+    (void)callback;
+    RwFrameForAllChildren(frame, CustomRwFrameForAllChildren_RemoveUpgrade_Recurse, data);
     return frame;
 }
 
@@ -1773,9 +1743,24 @@ public:
                 MakeNOP(0x00749B3E, 9, true);
                 MakeJMP(0x00749B3E, NeverRender);
 
-                // Shared upgrade walk: native callback for non-wheel, NeverRender for bIsVarWheel
+                // Junior: when wheel/other upgrades are added or removed, hide/show var-wheel clones
                 MakeCALL(0x006D386C, CustomRwFrameForAllChildren_AddUpgrade);
                 MakeCALL(0x006D3A18, CustomRwFrameForAllChildren_RemoveUpgrade);
+
+                // Junior: mark upgrade exhaust/wheel frames for destroy-on-remove
+                MakeInline<0x006D3746, 0x006D3746 + 5>([](reg_pack& regs)
+                    {
+                        regs.ecx = 0x3F800000; // original code
+                        RwFrame* frame = (RwFrame*)regs.edi;
+                        FRAME_EXTENSION(frame)->flags.bDestroyOnRemoveUpgrade = true;
+                    });
+                MakeInline<0x006D3539, 0x006D3539 + 5>([](reg_pack& regs)
+                    {
+                        regs.esi = regs.eax;
+                        regs.edi = *(uintptr_t*)(regs.esi + 0x4);
+                        RwFrame* frame = (RwFrame*)regs.edi;
+                        FRAME_EXTENSION(frame)->flags.bDestroyOnRemoveUpgrade = true;
+                    });
 
                 // Junior: mark upgrades updated (spoiler hide/show)
                 MakeInline<0x006E32AB, 0x006E32AB + 8>([](reg_pack& regs)
@@ -1878,10 +1863,7 @@ public:
 
                     // Junior: apply variable wheels after node walk
                     if (d.wheelFrame[0])
-                    {
                         SetWheel(d.wheelFrame, vehicle);
-                        UpdateVarWheelVisibility(vehicle);
-                    }
 
                     // Junior: apply _cl= colors once
                     SetCharacteristicsInRender(vehicle);
@@ -1965,12 +1947,8 @@ public:
                     ProcessPopup(vehicle, &d);
 
                 // Junior: hide f_spoiler when tuning spoiler is installed
-                // + variable-wheel NeverRender vs tuning wheel (no shared upgrade hook)
                 if (d.flags.bUpgradesUpdated)
-                {
                     ProcessSpoiler(vehicle, d.spoilerFrames, false);
-                    UpdateVarWheelVisibility(vehicle);
-                }
             };
 
         Events::vehicleRenderEvent.after += [](CVehicle* vehicle)
