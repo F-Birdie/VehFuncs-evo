@@ -11,6 +11,9 @@
 #include "CVehicleModelInfo.h"
 #include "CStreaming.h"
 #include "CTimer.h"
+#include "CPad.h"
+#include "CPed.h"
+#include "CTrailer.h"
 #include "assembly.hpp"
 #include <string>
 #include <list>
@@ -284,9 +287,13 @@ static list<string>& getClassList()
 }
 
 // ============================================================
-// Junior Hitch (by Fabio) — custom tow-bar attach point via f_hitch
-// VMT hook on CAutomobile::GetTowBarPos / CTrailer::GetTowBarPos
+// Junior Hitch — f_hitch + unhook
+// Unhook: handbrake + look behind 1.5s
+// Legs: ResetSuspension + PlaceOnRoadProperly
+// No re-link: STATUS_SIMPLE once for 2.5s, then ABANDONED + wake
 // ============================================================
+
+#include "CTrailer.h"
 
 typedef bool(__thiscall* GetTowBarPos_t)(CAutomobile* ths, RwV3d* point, char a3, CAutomobile* a4);
 
@@ -301,20 +308,24 @@ namespace Hitch
     static CAutomobile* a1 = nullptr;
     static int result = 0;
 
+    static unsigned int unhookHoldStart = 0;
+    static const unsigned int UNHOOK_HOLD_MS = 1500;
+
+    static CVehicle* s_blockTrailer = nullptr;
+    static unsigned int s_blockUntil = 0;
+    static const unsigned int BLOCK_MS = 2000;
+
     static bool isCustomCar(CAutomobile* mob, RwV3d& point)
     {
         ExtendedData& xdata = xData.Get(mob);
-        if (xdata.hitchFrame == nullptr) return false;
+        if (!xdata.hitchFrame)
+            return false;
 
         RpAtomic* atomic = (RpAtomic*)GetFirstObject(xdata.hitchFrame);
-        if (atomic)
-        {
-            if (atomic->object.object.flags & 0x4) {}
-            else return false; // atomic exists but isn't visible - fall back to original
-        }
+        if (atomic && !(atomic->object.object.flags & 0x4))
+            return false;
 
         RwMatrix* matrix = RwFrameGetLTM(xdata.hitchFrame);
-
         point.x = matrix->pos.x;
         point.y = matrix->pos.y;
         point.z = matrix->pos.z;
@@ -324,17 +335,14 @@ namespace Hitch
     static bool GetTowBarPos(CAutomobile* thisA, RwV3d* point, char a3, CAutomobile* a4)
     {
         RwV3d pp;
-
         if (isCustomCar(thisA, pp))
         {
             *point = pp;
             return true;
         }
-
         if (thisA->m_nVehicleSubClass != VEHICLE_TRAILER)
             return GetTowBarPosOriginal(thisA, point, a3, a4);
-        else
-            return GetTowBarPosOriginal_Trailer(thisA, point, a3, a4);
+        return GetTowBarPosOriginal_Trailer(thisA, point, a3, a4);
     }
 
     static void wrapper()
@@ -349,24 +357,106 @@ namespace Hitch
             mov veh, ecx
             mov eax, [esp + 4]
             mov p, eax
-
             mov al, [esp + 8]
             mov a0, al
-
             mov eax, [esp + 12]
             mov a1, eax
-
             pushad
             pushfd
-
             call wrapper
-
             popfd
             popad
-
             mov eax, result
-
             retn 0xC
+        }
+    }
+
+    static void ForceDetachTrailer(CVehicle* cab)
+    {
+        CVehicle* trailer = cab->m_pTrailer;
+        if (!trailer)
+            return;
+
+        trailer->BreakTowLink();
+        cab->BreakTowLink();
+        cab->m_pTrailer = nullptr;
+        trailer->m_pTractor = nullptr;
+
+        if (trailer->m_nVehicleSubClass == VEHICLE_TRAILER)
+        {
+            CTrailer* tr = reinterpret_cast<CTrailer*>(trailer);
+            tr->ResetSuspension();
+            tr->PlaceOnRoadProperly();
+        }
+
+        s_blockTrailer = trailer;
+        s_blockUntil = CTimer::m_snTimeInMilliseconds + BLOCK_MS;
+        trailer->m_nStatus = (eEntityStatus)2; // STATUS_SIMPLE — set once
+    }
+
+    static void ProcessRelinkBlock()
+    {
+        if (!s_blockTrailer)
+            return;
+
+        // Trailer deleted / streamed out while we were waiting
+        if (!IsVehiclePointerValid(s_blockTrailer))
+        {
+            s_blockTrailer = nullptr;
+            return;
+        }
+
+        if (CTimer::m_snTimeInMilliseconds < s_blockUntil)
+            return;
+
+        s_blockTrailer->m_nStatus = STATUS_ABANDONED; // or (eEntityStatus)4
+        s_blockTrailer->AddToMovingList();
+        s_blockTrailer->m_vecMoveSpeed.z = -0.01f;
+        s_blockTrailer = nullptr;
+    }
+
+    static void ProcessUnhook()
+    {
+        ProcessRelinkBlock();
+
+        CPed* ped = FindPlayerPed();
+        if (!ped || !ped->m_pVehicle)
+        {
+            unhookHoldStart = 0;
+            return;
+        }
+
+        CVehicle* cab = ped->m_pVehicle;
+        if (!cab->m_pTrailer)
+        {
+            unhookHoldStart = 0;
+            return;
+        }
+
+        CPad* pad = CPad::GetPad(0);
+        if (!pad)
+        {
+            unhookHoldStart = 0;
+            return;
+        }
+
+        if (!(pad->GetHandBrake() && pad->GetLookBehindForCar()))
+        {
+            unhookHoldStart = 0;
+            return;
+        }
+
+        unsigned int now = CTimer::m_snTimeInMilliseconds;
+        if (unhookHoldStart == 0)
+        {
+            unhookHoldStart = now;
+            return;
+        }
+
+        if (now - unhookHoldStart >= UNHOOK_HOLD_MS)
+        {
+            ForceDetachTrailer(cab);
+            unhookHoldStart = 0;
         }
     }
 }
@@ -1706,6 +1796,9 @@ public:
         // Junior: Hitch — CTrailer
         Hitch::GetTowBarPosOriginal_Trailer = (GetTowBarPos_t)ReadMemory<int*>(0x871D18, true);
         WriteMemory(0x871D18, memory_pointer(Hitch::GetTowBarPosToHook).as_int(), true);
+
+        // Hitch — Unhook
+        Events::gameProcessEvent += [] { Hitch::ProcessUnhook(); };
 
         // Junior: ug_dummy hierarchy id fix
         MakeInline<0x004C8FA1, 0x004C8FA1 + 6>([](reg_pack& regs)
