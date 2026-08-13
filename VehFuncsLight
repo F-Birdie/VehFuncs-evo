@@ -1142,64 +1142,87 @@ static void SetWheel(RwFrame* frame[6], CVehicle* vehicle)
 }
 
 // ============================================================
-// Upgrade add/remove — ONLY touch variable-wheel clones (bIsVarWheel).
-// Full Junior path also walks fog/exhaust upgrade trees with RemoveObjectsCB;
-// that was crashing on cancel-preview for non-wheel upgrades.
+// Upgrade add/remove
+// - Native callback on each direct child EXCEPT bIsVarWheel (exhaust/fog OK)
+// - Var wheels: only bNeverRender, never let native destroy their atomics
 // ============================================================
 
-static RpAtomic* __cdecl SafeRemoveAtomicCB(RpAtomic* atomic, void* data)
+static void VarWheel_SetNeverRender(RwFrame* frame, bool hide)
+{
+    while (frame)
+    {
+        if (FRAME_EXTENSION(frame)->flags.bIsVarWheel)
+            FRAME_EXTENSION(frame)->flags.bNeverRender = hide ? 1 : 0;
+
+        if (frame->child)
+            VarWheel_SetNeverRender(frame->child, hide);
+
+        frame = frame->next;
+    }
+}
+
+static RwFrame* (__cdecl* s_upgradeInnerCb)(RwFrame*, void*) = nullptr;
+static void* s_upgradeInnerData = nullptr;
+
+static RwFrame* __cdecl SkipVarWheel_Callback(RwFrame* frame, void* data)
 {
     (void)data;
-    if (!atomic) return nullptr;
-    if (atomic->clump)
-        RpClumpRemoveAtomic(atomic->clump, atomic);
-    RpAtomicDestroy(atomic);
-    return nullptr;
-}
+    if (frame && FRAME_EXTENSION(frame)->flags.bIsVarWheel)
+        return frame; // do not let native remove/destroy var-wheel clones
 
-static RwFrame* __cdecl CustomRwFrameForAllChildren_AddUpgrade_Recurse(RwFrame* frame, void* data)
-{
-    (void)data;
-    // Only hide variable-wheel clones — do not touch fog/exhaust/other frames
-    if (FRAME_EXTENSION(frame)->flags.bIsVarWheel)
-        FRAME_EXTENSION(frame)->flags.bNeverRender = true;
+    if (s_upgradeInnerCb)
+        return s_upgradeInnerCb(frame, s_upgradeInnerData);
 
-    if (RwFrame* c = frame->child)
-        CustomRwFrameForAllChildren_AddUpgrade_Recurse(c, data);
-    if (RwFrame* n = frame->next)
-        CustomRwFrameForAllChildren_AddUpgrade_Recurse(n, data);
     return frame;
 }
 
-static RwFrame* __cdecl CustomRwFrameForAllChildren_AddUpgrade(RwFrame* frame, RwFrame* (__cdecl* callback)(RwFrame*, void*), void* data)
+static void ForEachDirectChild_NativeExceptVarWheels(
+    RwFrame* frame,
+    RwFrame* (__cdecl* callback)(RwFrame*, void*),
+    void* data)
 {
-    (void)callback;
-    if (RwFrame* c = frame->child)
-        CustomRwFrameForAllChildren_AddUpgrade_Recurse(c, data);
-    return frame;
-}
+    if (!frame || !callback)
+        return;
 
-static RwFrame* __cdecl CustomRwFrameForAllChildren_RemoveUpgrade_Recurse(RwFrame* frame, void* data)
-{
-    if (FRAME_EXTENSION(frame)->flags.bDestroyOnRemoveUpgrade)
+    s_upgradeInnerCb = callback;
+    s_upgradeInnerData = data;
+
+    RwFrame* child = frame->child;
+    while (child)
     {
-        // Upgrade-owned meshes: strip atomics safely (data may be clump; use atomic->clump)
-        RwFrameForAllObjects(frame, (RwObjectCallBack)SafeRemoveAtomicCB, data);
-    }
-    else if (FRAME_EXTENSION(frame)->flags.bIsVarWheel)
-    {
-        // Show variable wheels again after cancel / remove upgrade
-        FRAME_EXTENSION(frame)->flags.bNeverRender = false;
+        RwFrame* next = child->next;
+        if (!SkipVarWheel_Callback(child, data))
+            break;
+        child = next;
     }
 
-    RwFrameForAllChildren(frame, CustomRwFrameForAllChildren_RemoveUpgrade_Recurse, data);
+    s_upgradeInnerCb = nullptr;
+    s_upgradeInnerData = nullptr;
+}
+
+static RwFrame* __cdecl CustomRwFrameForAllChildren_AddUpgrade(
+    RwFrame* frame,
+    RwFrame* (__cdecl* callback)(RwFrame*, void*),
+    void* data)
+{
+    ForEachDirectChild_NativeExceptVarWheels(frame, callback, data);
+
+    if (frame && frame->child)
+        VarWheel_SetNeverRender(frame->child, true);
+
     return frame;
 }
 
-static RwFrame* __cdecl CustomRwFrameForAllChildren_RemoveUpgrade(RwFrame* frame, RwFrame* (__cdecl* callback)(RwFrame*, void*), void* data)
+static RwFrame* __cdecl CustomRwFrameForAllChildren_RemoveUpgrade(
+    RwFrame* frame,
+    RwFrame* (__cdecl* callback)(RwFrame*, void*),
+    void* data)
 {
-    (void)callback;
-    RwFrameForAllChildren(frame, CustomRwFrameForAllChildren_RemoveUpgrade_Recurse, data);
+    ForEachDirectChild_NativeExceptVarWheels(frame, callback, data);
+
+    if (frame && frame->child)
+        VarWheel_SetNeverRender(frame->child, false);
+
     return frame;
 }
 
@@ -1836,24 +1859,9 @@ public:
                 MakeNOP(0x00749B3E, 9, true);
                 MakeJMP(0x00749B3E, NeverRender);
 
-                // Junior: when wheel/other upgrades are added or removed, hide/show var-wheel clones
+                // Upgrade ForAllChildren — native callback + var-wheel NeverRender only
                 MakeCALL(0x006D386C, CustomRwFrameForAllChildren_AddUpgrade);
                 MakeCALL(0x006D3A18, CustomRwFrameForAllChildren_RemoveUpgrade);
-
-                // Junior: mark upgrade exhaust/wheel frames for destroy-on-remove
-                MakeInline<0x006D3746, 0x006D3746 + 5>([](reg_pack& regs)
-                    {
-                        regs.ecx = 0x3F800000; // original code
-                        RwFrame* frame = (RwFrame*)regs.edi;
-                        FRAME_EXTENSION(frame)->flags.bDestroyOnRemoveUpgrade = true;
-                    });
-                MakeInline<0x006D3539, 0x006D3539 + 5>([](reg_pack& regs)
-                    {
-                        regs.esi = regs.eax;
-                        regs.edi = *(uintptr_t*)(regs.esi + 0x4);
-                        RwFrame* frame = (RwFrame*)regs.edi;
-                        FRAME_EXTENSION(frame)->flags.bDestroyOnRemoveUpgrade = true;
-                    });
 
                 // Junior: mark upgrades updated (spoiler hide/show)
                 MakeInline<0x006E32AB, 0x006E32AB + 8>([](reg_pack& regs)
