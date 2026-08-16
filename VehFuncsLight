@@ -1,5 +1,6 @@
 /*
  * VehFuncs Light — f_class + f_extras + variable wheels + f_spoiler + _cl= + _pj= + f_hitch + f_gear/f_fan
+ * + f_sld_ (slide doors) + f_ang_ (door open angle)
  * Logic taken from Junior_Djjr VehFuncs (RecursiveExtras / collapse / wheels / GearAndFan)
  * https://github.com/JuniorDjjr/VehFuncs
  */
@@ -22,6 +23,11 @@
 #include <sstream>
 #include <cstdlib>
 #include <cctype>
+#include <Windows.h>
+#include <unordered_map>
+#include <algorithm>
+#include <cstdint>
+#include <cmath>
 
 using namespace plugin;
 using namespace std;
@@ -1797,6 +1803,406 @@ static void __cdecl CustomAssignRemapTxd(const char* txdName, uint16_t txdId)
 // Plugin
 // ============================================================
 
+
+// ============================================================
+// VehFuncs Extras — f_sld_ (slide doors) + f_ang_ (open angle)
+// Separate from Junior core; heli ped entry via ProcessOpenDoor VMT
+// ============================================================
+
+namespace VehFuncsExtrasShared
+{
+    static bool CarNodeToDoorIndex(eCarNodes node, int& outDoorIndex)
+    {
+        switch (node)
+        {
+        case CAR_BONNET:  outDoorIndex = 0; return true;
+        case CAR_BOOT:    outDoorIndex = 1; return true;
+        case CAR_DOOR_LF: outDoorIndex = 2; return true;
+        case CAR_DOOR_RF: outDoorIndex = 3; return true;
+        case CAR_DOOR_LR: outDoorIndex = 4; return true;
+        case CAR_DOOR_RR: outDoorIndex = 5; return true;
+        default: return false;
+        }
+    }
+
+    static void CollectParents(RwFrame* frame, std::unordered_map<RwFrame*, RwFrame*>& parentOf)
+    {
+        if (!frame) return;
+        for (RwFrame* child = frame->child; child; child = child->next)
+        {
+            parentOf[child] = frame;
+            CollectParents(child, parentOf);
+        }
+    }
+
+    // eCarNodes / eHeliNodes agree 0–11; diverge from 12 (bonnet/boot vs rudder…)
+    static int MaxNodeForVehicle(bool isHeli)
+    {
+        return isHeli ? (HELI_DOOR_LR + 1) : CAR_NUM_NODES;
+    }
+
+    static bool IsHelicopter(CVehicle* vehicle)
+    {
+        if (!vehicle) return false;
+        if (vehicle->m_nVehicleClass == VEHICLE_HELI)
+            return true;
+        switch (vehicle->m_nModelIndex)
+        {
+        case 417: case 425: case 447: case 469:
+        case 487: case 488: case 497: case 548: case 563:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    static std::vector<CVehicle*> g_activeHelis;
+
+    static void TrackIfHeli(CVehicle* vehicle)
+    {
+        if (!IsHelicopter(vehicle)) return;
+        if (std::find(g_activeHelis.begin(), g_activeHelis.end(), vehicle) == g_activeHelis.end())
+            g_activeHelis.push_back(vehicle);
+    }
+
+    static void StopTracking(CVehicle* vehicle)
+    {
+        auto it = std::find(g_activeHelis.begin(), g_activeHelis.end(), vehicle);
+        if (it != g_activeHelis.end())
+            g_activeHelis.erase(it);
+    }
+}
+
+namespace AngleOverride
+{
+    using namespace VehFuncsExtrasShared;
+
+    static bool TryGetAngleOverrideRadians(RwFrame* parentFrame, float& outRadians)
+    {
+        if (!parentFrame) return false;
+        char* parentName = GetFrameNodeName(parentFrame);
+        if (!parentName) return false;
+        if (strncmp(parentName, "f_ang_", 6) != 0) return false;
+        char* end = nullptr;
+        long degrees = strtol(parentName + 6, &end, 10);
+        if (end == parentName + 6) return false;
+        outRadians = degrees * (3.14159265f / 180.0f);
+        return true;
+    }
+
+    static std::unordered_map<CVehicle*, bool> g_processedVehicles;
+
+    static void ScanVehicle(CAutomobile* automobile, bool isHeli)
+    {
+        CVehicle* vehicle = static_cast<CVehicle*>(automobile);
+        if (g_processedVehicles[vehicle]) return;
+        if (!vehicle->m_pRwClump)
+        {
+            g_processedVehicles[vehicle] = true;
+            return;
+        }
+
+        int maxNode = MaxNodeForVehicle(isHeli);
+        RwFrame* rootFrame = reinterpret_cast<RwFrame*>(vehicle->m_pRwClump->object.parent);
+        std::unordered_map<RwFrame*, RwFrame*> parentOf;
+        CollectParents(rootFrame, parentOf);
+
+        for (int node = CAR_NODE_NONE; node < maxNode; ++node)
+        {
+            RwFrame* dummyFrame = automobile->m_aCarNodes[node];
+            if (!dummyFrame) continue;
+
+            int doorIndex;
+            if (!CarNodeToDoorIndex(static_cast<eCarNodes>(node), doorIndex))
+                continue;
+
+            auto it = parentOf.find(dummyFrame);
+            RwFrame* parentFrame = (it != parentOf.end()) ? it->second : nullptr;
+            float radians;
+            if (TryGetAngleOverrideRadians(parentFrame, radians))
+                automobile->m_doors[doorIndex].m_fOpenAngle = radians;
+        }
+        g_processedVehicles[vehicle] = true;
+    }
+
+    void Update(CAutomobile* automobile)
+    {
+        if (!automobile) return;
+        bool isHeli = IsHelicopter(static_cast<CVehicle*>(automobile));
+        ScanVehicle(automobile, isHeli);
+    }
+
+    void OnVehicleDestroyed(CVehicle* vehicle)
+    {
+        g_processedVehicles.erase(vehicle);
+    }
+}
+
+namespace SlideDoor
+{
+    using namespace VehFuncsExtrasShared;
+
+    static bool TryGetSlideOverride(const char* parentName, CVector& outOffset)
+    {
+        if (strncmp(parentName, "f_sld_", 6) != 0)
+            return false;
+        const char* cursor = parentName + 6;
+        char* end = nullptr;
+        float x = strtof(cursor, &end);
+        if (end == cursor || *end != ',') return false;
+        cursor = end + 1;
+        float y = strtof(cursor, &end);
+        if (end == cursor || *end != ',') return false;
+        cursor = end + 1;
+        float z = strtof(cursor, &end);
+        if (end == cursor) return false;
+        outOffset = CVector(x, y, z);
+        return true;
+    }
+
+    static constexpr float kSmallAxisSpeedRatio = 0.4f;
+
+    struct AxisSlices
+    {
+        float sliceStart[3] = {};
+        float sliceEnd[3] = {};
+    };
+
+    static AxisSlices ComputeAxisSlices(const CVector& offset, float smallAxisSpeedRatio)
+    {
+        AxisSlices result;
+        struct AxisEntry { int idx; float mag; };
+        std::vector<AxisEntry> active;
+        if (offset.x != 0.0f) active.push_back({ 0, std::fabs(offset.x) });
+        if (offset.y != 0.0f) active.push_back({ 1, std::fabs(offset.y) });
+        if (offset.z != 0.0f) active.push_back({ 2, std::fabs(offset.z) });
+        if (active.empty()) return result;
+
+        std::sort(active.begin(), active.end(),
+            [](const AxisEntry& a, const AxisEntry& b) { return a.mag < b.mag; });
+
+        int n = static_cast<int>(active.size());
+        if (n == 1)
+        {
+            result.sliceStart[active[0].idx] = 0.0f;
+            result.sliceEnd[active[0].idx] = 1.0f;
+            return result;
+        }
+
+        float r = std::max(smallAxisSpeedRatio, 0.001f);
+        float leadMag = active[n - 1].mag;
+        float sumSmallMag = 0.0f;
+        for (int i = 0; i < n - 1; ++i)
+            sumSmallMag += active[i].mag;
+
+        float leadSpeedUnit = leadMag + sumSmallMag / r;
+        float cursor = 0.0f;
+        for (int i = 0; i < n - 1; ++i)
+        {
+            float duration = active[i].mag / (r * leadSpeedUnit);
+            result.sliceStart[active[i].idx] = cursor;
+            result.sliceEnd[active[i].idx] = cursor + duration;
+            cursor += duration;
+        }
+        result.sliceStart[active[n - 1].idx] = cursor;
+        result.sliceEnd[active[n - 1].idx] = 1.0f;
+        return result;
+    }
+
+    struct SlideData
+    {
+        bool hasOverride[6] = {};
+        CVector slideOffset[6] = {};
+        CVector closedPosition[6] = {};
+        AxisSlices slices[6] = {};
+        bool scanned = false;
+    };
+
+    static std::unordered_map<CVehicle*, SlideData> g_slideData;
+
+    static float ApplyAxisSlide(float closed, float offset, float ratio, float sliceStart, float sliceEnd)
+    {
+        if (offset == 0.0f) return closed;
+        float t;
+        if (ratio <= sliceStart) t = 0.0f;
+        else if (ratio >= sliceEnd) t = 1.0f;
+        else t = (ratio - sliceStart) / (sliceEnd - sliceStart);
+        return closed + offset * t;
+    }
+
+    static eCarNodes DoorIndexToNode(int doorIndex)
+    {
+        switch (doorIndex)
+        {
+        case 0: return CAR_BONNET;
+        case 1: return CAR_BOOT;
+        case 2: return CAR_DOOR_LF;
+        case 3: return CAR_DOOR_RF;
+        case 4: return CAR_DOOR_LR;
+        case 5: return CAR_DOOR_RR;
+        default: return CAR_NODE_NONE;
+        }
+    }
+
+    static void ApplySlideForDoor(CAutomobile* automobile, int doorIndex)
+    {
+        if (!automobile || doorIndex < 0 || doorIndex > 5)
+            return;
+
+        auto it = g_slideData.find(static_cast<CVehicle*>(automobile));
+        if (it == g_slideData.end() || !it->second.scanned || !it->second.hasOverride[doorIndex])
+            return;
+
+        SlideData& data = it->second;
+        eCarNodes node = DoorIndexToNode(doorIndex);
+        if (node == CAR_NODE_NONE)
+            return;
+
+        RwFrame* frame = automobile->m_aCarNodes[node];
+        if (!frame)
+            return;
+
+        float ratio = automobile->m_doors[doorIndex].GetAngleOpenRatio();
+        const CVector& offset = data.slideOffset[doorIndex];
+        const CVector& closed = data.closedPosition[doorIndex];
+        const AxisSlices& slices = data.slices[doorIndex];
+
+        CVector newPos(
+            ApplyAxisSlide(closed.x, offset.x, ratio, slices.sliceStart[0], slices.sliceEnd[0]),
+            ApplyAxisSlide(closed.y, offset.y, ratio, slices.sliceStart[1], slices.sliceEnd[1]),
+            ApplyAxisSlide(closed.z, offset.z, ratio, slices.sliceStart[2], slices.sliceEnd[2])
+        );
+
+        RwV3d rwPos{ newPos.x, newPos.y, newPos.z };
+        RwMatrix* rwMat = RwFrameGetMatrix(frame);
+        if (!rwMat)
+            return;
+        RwMatrixSetIdentity(rwMat);
+        RwMatrixTranslate(rwMat, &rwPos, rwCOMBINEREPLACE);
+        RwFrameUpdateObjects(frame);
+    }
+
+    static void ScanVehicle(CAutomobile* automobile, SlideData& data, bool isHeli)
+    {
+        CVehicle* vehicle = static_cast<CVehicle*>(automobile);
+        if (data.scanned)
+            return;
+        if (!vehicle->m_pRwClump)
+        {
+            data.scanned = true;
+            return;
+        }
+
+        int maxNode = MaxNodeForVehicle(isHeli);
+        RwFrame* rootFrame = reinterpret_cast<RwFrame*>(vehicle->m_pRwClump->object.parent);
+        if (!rootFrame)
+        {
+            data.scanned = true;
+            return;
+        }
+
+        std::unordered_map<RwFrame*, RwFrame*> parentOf;
+        CollectParents(rootFrame, parentOf);
+
+        for (int node = CAR_NODE_NONE; node < maxNode; ++node)
+        {
+            RwFrame* dummyFrame = automobile->m_aCarNodes[node];
+            if (!dummyFrame) continue;
+
+            int doorIndex;
+            if (!CarNodeToDoorIndex(static_cast<eCarNodes>(node), doorIndex))
+                continue;
+
+            auto parentIt = parentOf.find(dummyFrame);
+            if (parentIt == parentOf.end()) continue;
+
+            char* parentName = GetFrameNodeName(parentIt->second);
+            if (!parentName) continue;
+
+            CVector offset;
+            if (!TryGetSlideOverride(parentName, offset))
+                continue;
+
+            data.hasOverride[doorIndex] = true;
+            data.slideOffset[doorIndex] = offset;
+            data.slices[doorIndex] = ComputeAxisSlices(offset, kSmallAxisSpeedRatio);
+
+            RwMatrix* mat = RwFrameGetMatrix(dummyFrame);
+            if (mat)
+            {
+                RwV3d* pos = RwMatrixGetPos(mat);
+                data.closedPosition[doorIndex] = CVector(pos->x, pos->y, pos->z);
+            }
+        }
+        data.scanned = true;
+    }
+
+    static void ApplySlideOverrides(CAutomobile* automobile, SlideData& data, bool isHeli)
+    {
+        (void)isHeli;
+        for (int i = 0; i < 6; ++i)
+        {
+            if (data.hasOverride[i])
+                ApplySlideForDoor(automobile, i);
+        }
+    }
+
+    void Update(CAutomobile* automobile)
+    {
+        if (!automobile) return;
+        CVehicle* vehicle = static_cast<CVehicle*>(automobile);
+        bool isHeli = IsHelicopter(vehicle);
+        SlideData& data = g_slideData[vehicle];
+        ScanVehicle(automobile, data, isHeli);
+        if (data.scanned)
+            ApplySlideOverrides(automobile, data, isHeli);
+    }
+
+    void OnVehicleDestroyed(CVehicle* vehicle)
+    {
+        g_slideData.erase(vehicle);
+    }
+
+    using ProcessOpenDoor_t = void(__thiscall*)(CVehicle*, CPed*, uint32_t, uint32_t, uint32_t, float);
+    static ProcessOpenDoor_t Real_ProcessOpenDoor = nullptr;
+
+    static void __fastcall ProcessOpenDoor_Hook(CVehicle* self, void*, CPed* ped,
+        uint32_t doorComponentId, uint32_t arg2, uint32_t arg3, float arg4)
+    {
+        if (Real_ProcessOpenDoor)
+            Real_ProcessOpenDoor(self, ped, doorComponentId, arg2, arg3, arg4);
+
+        if (!self)
+            return;
+        if (self->m_nVehicleClass != VEHICLE_AUTOMOBILE &&
+            self->m_nVehicleClass != VEHICLE_HELI)
+            return;
+
+        Update(static_cast<CAutomobile*>(self));
+    }
+
+    static void PatchProcessOpenDoorSlot(uintptr_t* vmt)
+    {
+        if (!vmt) return;
+        const int slot = 28;
+        DWORD oldProt;
+        if (!VirtualProtect(&vmt[slot], sizeof(uintptr_t), PAGE_READWRITE, &oldProt))
+            return;
+        if (!Real_ProcessOpenDoor)
+            Real_ProcessOpenDoor = reinterpret_cast<ProcessOpenDoor_t>(vmt[slot]);
+        vmt[slot] = reinterpret_cast<uintptr_t>(&ProcessOpenDoor_Hook);
+        VirtualProtect(&vmt[slot], sizeof(uintptr_t), oldProt, &oldProt);
+    }
+
+    static void InstallProcessOpenDoorHooks()
+    {
+        // US 1.0 HOODLUM
+        PatchProcessOpenDoorSlot(reinterpret_cast<uintptr_t*>(0x871120)); // CAutomobile
+        PatchProcessOpenDoorSlot(reinterpret_cast<uintptr_t*>(0x871680)); // CHeli
+    }
+}
+
+
 class VehFuncsLight
 {
 public:
@@ -1842,6 +2248,12 @@ public:
                     (RwPluginObjectConstructor)FramePlugin::Init,
                     (RwPluginObjectDestructor)FramePlugin::Destroy,
                     (RwPluginObjectCopy)FramePlugin::Copy);
+            };
+
+        // Slide doors: ProcessOpenDoor VMT (ped entry) — both auto + heli class tables
+        Events::initRwEvent += []
+            {
+                SlideDoor::InstallProcessOpenDoorHooks();
             };
 
         Events::initScriptsEvent.before += []
@@ -1946,11 +2358,24 @@ public:
                 d.popupProgress[0] = d.popupProgress[1] = 0.0f;
                 d.flags.bPreservePaintjobColor = 0;
                 d.flags.bUpgradesUpdated = 1;
+
+                // f_sld_ / f_ang_
+                AngleOverride::g_processedVehicles[vehicle] = false;
+                SlideDoor::g_slideData[vehicle] = SlideDoor::SlideData{};
+                VehFuncsExtrasShared::TrackIfHeli(vehicle);
             };
 
         Events::vehicleRenderEvent.before += [](CVehicle* vehicle)
             {
                 if (!vehicle || !vehicle->m_pRwClump) return;
+
+                // f_ang_ + f_sld_ — automobiles only here (helis: processScripts + ProcessOpenDoor)
+                if (vehicle->m_nVehicleClass == VEHICLE_AUTOMOBILE)
+                {
+                    AngleOverride::Update(static_cast<CAutomobile*>(vehicle));
+                    SlideDoor::Update(static_cast<CAutomobile*>(vehicle));
+                }
+
                 ExtendedData& d = xData.Get(vehicle);
 
                 if (d.nodesProcess)
@@ -2061,6 +2486,25 @@ public:
                     ProcessSpoiler(vehicle, d.spoilerFrames, true);
                     d.flags.bUpgradesUpdated = 0;
                 }
+            };
+
+        // Helicopters: f_ang_ + f_sld_ (render event unreliable for helis)
+        Events::processScriptsEvent += []
+            {
+                for (CVehicle* vehicle : VehFuncsExtrasShared::g_activeHelis)
+                {
+                    if (!vehicle) continue;
+                    AngleOverride::Update(static_cast<CAutomobile*>(vehicle));
+                    SlideDoor::Update(static_cast<CAutomobile*>(vehicle));
+                }
+            };
+
+        Events::vehicleDtorEvent.before += [](CVehicle* vehicle)
+            {
+                if (!vehicle) return;
+                AngleOverride::OnVehicleDestroyed(vehicle);
+                SlideDoor::OnVehicleDestroyed(vehicle);
+                VehFuncsExtrasShared::StopTracking(vehicle);
             };
     }
 } vehFuncsLight;
