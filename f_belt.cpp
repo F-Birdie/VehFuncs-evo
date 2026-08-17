@@ -3,8 +3,9 @@
 #include "CVehicle.h"
 #include "RenderWare.h"
 #include "common.h"
-#include "NodeName.h"          // ← this is the key
+#include "NodeName.h"
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <cstring>
 #include <cstdlib>
@@ -19,7 +20,11 @@ struct OriginalUVs
 };
 
 static std::unordered_map<RpGeometry*, OriginalUVs> g_originalUVs;
-static float g_beltOffset = 0.0f;
+static std::unordered_map<int, float> g_modelOffsets;
+
+// Used to make sure we only advance each model once per frame
+static std::unordered_set<int> g_advancedThisFrame;
+static unsigned int g_lastFrameCounter = 0;
 
 void ApplyBeltScroll(RpGeometry* geometry, float offset)
 {
@@ -57,22 +62,18 @@ void ApplyBeltScroll(RpGeometry* geometry, float offset)
 float GetBeltSpeedMultiplier(const char* name)
 {
     if (!name) return 1.0f;
-
     const char* mu = strstr(name, "_mu=");
     if (!mu) return 1.0f;
-
     return static_cast<float>(atof(mu + 4));
 }
 
-// Walk up the parent chain looking for a frame that starts with "f_belt"
 const char* FindBeltNodeName(RwFrame* frame)
 {
     while (frame)
     {
-        char* name = GetFrameNodeName(frame);   // from NodeName.h
+        char* name = GetFrameNodeName(frame);
         if (name && _strnicmp(name, "f_belt", 6) == 0)
             return name;
-
         frame = RwFrameGetParent(frame);
     }
     return nullptr;
@@ -88,12 +89,38 @@ public:
                 if (!vehicle || !vehicle->m_pRwClump)
                     return;
 
-                g_beltOffset += CTimer::ms_fTimeStep * DEFAULT_BELT_SPEED;
+                const int modelId = vehicle->m_nModelIndex;
+
+                // Detect new frame
+                unsigned int currentFrame = CTimer::m_FrameCounter;
+                if (currentFrame != g_lastFrameCounter)
+                {
+                    g_advancedThisFrame.clear();
+                    g_lastFrameCounter = currentFrame;
+                }
+
+                // Advance this model only once per frame
+                if (g_advancedThisFrame.find(modelId) == g_advancedThisFrame.end())
+                {
+                    g_modelOffsets[modelId] += CTimer::ms_fTimeStep * DEFAULT_BELT_SPEED;
+                    g_advancedThisFrame.insert(modelId);
+                }
+
+                float offset = g_modelOffsets[modelId];
+
+                // Process geometries only once per frame
+                static std::unordered_set<RpGeometry*> processed;
+                processed.clear();
 
                 RpClumpForAllAtomics(vehicle->m_pRwClump,
-                    [](RpAtomic* atomic, void*) -> RpAtomic*
+                    [](RpAtomic* atomic, void* data) -> RpAtomic*
                     {
+                        float offset = *static_cast<float*>(data);
+
                         if (!atomic || !atomic->geometry)
+                            return atomic;
+
+                        if (processed.count(atomic->geometry))
                             return atomic;
 
                         const char* name = FindBeltNodeName(RpAtomicGetFrame(atomic));
@@ -101,10 +128,12 @@ public:
                             return atomic;
 
                         float multiplier = GetBeltSpeedMultiplier(name);
-                        ApplyBeltScroll(atomic->geometry, g_beltOffset * multiplier);
+                        ApplyBeltScroll(atomic->geometry, offset * multiplier);
 
+                        processed.insert(atomic->geometry);
                         return atomic;
-                    }, nullptr);
+                    },
+                    &offset);
             };
     }
 } fBeltScroller;
