@@ -1,6 +1,7 @@
 #include "plugin.h"
 #include "CTimer.h"
 #include "CVehicle.h"
+#include "CAutomobile.h"
 #include "RenderWare.h"
 #include "common.h"
 #include "NodeName.h"
@@ -9,11 +10,15 @@
 #include <vector>
 #include <cstring>
 #include <cstdlib>
+#include <cmath>
 
 using namespace plugin;
 
-const float DEFAULT_BELT_SPEED = 0.012f;
-const float GAS_BOOST = 0.020f;   // how much faster it gets at full gas
+// ===================== TUNABLE =====================
+const float DEFAULT_BELT_SPEED = 0.012f;   // f_belt
+const float GAS_BOOST = 0.020f;   // f_chain extra at full gas
+const float TRACK_SCALE = 0.15f;    // track scroll vs wheel rotation
+// ===================================================
 
 struct OriginalUVs
 {
@@ -24,16 +29,15 @@ struct BeltRenderData
 {
     float constantOffset;
     float gasOffset;
+    float trackOffset[4];   // 0=LF, 1=LB, 2=RF, 3=RB
+    bool  isAutomobile;
 };
 
 static std::unordered_map<RpGeometry*, OriginalUVs> g_originalUVs;
-
-// Two separate running offsets per model
 static std::unordered_map<int, float> g_constantOffsets;
 static std::unordered_map<int, float> g_gasOffsets;
-
-static std::unordered_map<int, int> g_modelRefCount;
-static std::unordered_set<int> g_advancedThisFrame;
+static std::unordered_map<int, int>   g_modelRefCount;
+static std::unordered_set<int>        g_advancedThisFrame;
 static unsigned int g_lastFrameCounter = 0;
 
 void ApplyBeltScroll(RpGeometry* geometry, float offset)
@@ -45,31 +49,26 @@ void ApplyBeltScroll(RpGeometry* geometry, float offset)
     {
         OriginalUVs data;
         data.uvs.resize(geometry->numVertices);
-
         RwTexCoords* src = geometry->texCoords[0];
         for (RwInt32 i = 0; i < geometry->numVertices; ++i)
             data.uvs[i] = src[i];
-
         g_originalUVs[geometry] = std::move(data);
     }
 
     const auto& original = g_originalUVs[geometry].uvs;
     RwTexCoords* dst = geometry->texCoords[0];
-
     float wrapped = offset - floorf(offset);
 
     RpGeometryLock(geometry, rpGEOMETRYLOCKTEXCOORDS);
-
     for (RwInt32 i = 0; i < geometry->numVertices; ++i)
     {
         dst[i].u = original[i].u + wrapped;
         dst[i].v = original[i].v;
     }
-
     RpGeometryUnlock(geometry);
 }
 
-float GetBeltSpeedMultiplier(const char* name)
+float GetSpeedMultiplier(const char* name)
 {
     if (!name) return 1.0f;
     const char* mu = strstr(name, "_mu=");
@@ -77,18 +76,44 @@ float GetBeltSpeedMultiplier(const char* name)
     return static_cast<float>(atof(mu + 4));
 }
 
-bool IsGasBelt(const char* name)
+// Returns wheel index or -1
+// 0 = LF, 1 = LB, 2 = RF, 3 = RB
+int GetTrackWheel(const char* name)
 {
-    return name && _strnicmp(name, "f_beltg", 7) == 0;
+    if (!name) return -1;
+
+    if (_strnicmp(name, "f_track_lf", 10) == 0) return 0;
+    if (_strnicmp(name, "f_track_lb", 10) == 0) return 1;
+    if (_strnicmp(name, "f_track_rf", 10) == 0) return 2;
+    if (_strnicmp(name, "f_track_rb", 10) == 0) return 3;
+
+    return -1;
 }
 
-const char* FindBeltNodeName(RwFrame* frame)
+bool IsBelt(const char* name)
+{
+    return name && _strnicmp(name, "f_belt", 6) == 0;
+}
+
+bool IsChain(const char* name)
+{
+    return name && _strnicmp(name, "f_chain", 7) == 0;
+}
+
+const char* FindSpecialNodeName(RwFrame* frame)
 {
     while (frame)
     {
         char* name = GetFrameNodeName(frame);
-        if (name && _strnicmp(name, "f_belt", 6) == 0)
-            return name;
+        if (name)
+        {
+            if (_strnicmp(name, "f_belt", 6) == 0 ||
+                _strnicmp(name, "f_chain", 7) == 0 ||
+                _strnicmp(name, "f_track", 7) == 0)
+            {
+                return name;
+            }
+        }
         frame = RwFrameGetParent(frame);
     }
     return nullptr;
@@ -125,10 +150,8 @@ public:
                 if (!vehicle || !vehicle->m_pRwClump)
                     return;
 
-                if (!vehicle->bEngineOn)
-                    return;
-
                 const int modelId = vehicle->m_nModelIndex;
+                bool engineOn = vehicle->bEngineOn;
 
                 unsigned int currentFrame = CTimer::m_FrameCounter;
                 if (currentFrame != g_lastFrameCounter)
@@ -137,25 +160,36 @@ public:
                     g_lastFrameCounter = currentFrame;
                 }
 
-                // Advance the two offsets only once per model per frame
-                if (g_advancedThisFrame.find(modelId) == g_advancedThisFrame.end())
+                if (engineOn && g_advancedThisFrame.find(modelId) == g_advancedThisFrame.end())
                 {
                     float dt = CTimer::ms_fTimeStep;
-
-                    // Constant belts always run at base speed
                     g_constantOffsets[modelId] += dt * DEFAULT_BELT_SPEED;
 
-                    // Gas belts run at base speed + extra from gas pedal
-                    float gas = fabsf(vehicle->m_fGasPedal);          // 0.0 → 1.0
+                    float gas = fabsf(vehicle->m_fGasPedal);
                     float gasSpeed = DEFAULT_BELT_SPEED + gas * GAS_BOOST;
                     g_gasOffsets[modelId] += dt * gasSpeed;
 
                     g_advancedThisFrame.insert(modelId);
                 }
 
-                BeltRenderData rd;
+                BeltRenderData rd = {};
                 rd.constantOffset = g_constantOffsets[modelId];
                 rd.gasOffset = g_gasOffsets[modelId];
+                rd.isAutomobile = false;
+
+                if (vehicle->m_nVehicleClass == VEHICLE_AUTOMOBILE ||
+                    vehicle->m_nVehicleClass == VEHICLE_MTRUCK ||
+                    vehicle->m_nVehicleClass == VEHICLE_QUAD)
+                {
+                    CAutomobile* autoMobile = static_cast<CAutomobile*>(vehicle);
+                    rd.isAutomobile = true;
+
+                    // 0=LF, 1=LB, 2=RF, 3=RB
+                    rd.trackOffset[0] = autoMobile->m_fWheelRotation[0] * TRACK_SCALE;
+                    rd.trackOffset[1] = autoMobile->m_fWheelRotation[1] * TRACK_SCALE;
+                    rd.trackOffset[2] = autoMobile->m_fWheelRotation[2] * TRACK_SCALE;
+                    rd.trackOffset[3] = autoMobile->m_fWheelRotation[3] * TRACK_SCALE;
+                }
 
                 static std::unordered_set<RpGeometry*> processed;
                 processed.clear();
@@ -171,20 +205,40 @@ public:
                         if (processed.count(atomic->geometry))
                             return atomic;
 
-                        const char* name = FindBeltNodeName(RpAtomicGetFrame(atomic));
+                        const char* name = FindSpecialNodeName(RpAtomicGetFrame(atomic));
                         if (!name)
                             return atomic;
 
-                        float multiplier = GetBeltSpeedMultiplier(name);
+                        float multiplier = GetSpeedMultiplier(name);
+                        float finalOffset = 0.0f;
+                        bool apply = false;
 
-                        float finalOffset;
-                        if (IsGasBelt(name))
-                            finalOffset = rd->gasOffset * multiplier;
-                        else
+                        if (IsBelt(name))
+                        {
                             finalOffset = rd->constantOffset * multiplier;
+                            apply = true;
+                        }
+                        else if (IsChain(name))
+                        {
+                            finalOffset = rd->gasOffset * multiplier;
+                            apply = true;
+                        }
+                        else
+                        {
+                            int wheel = GetTrackWheel(name);
+                            if (wheel >= 0 && rd->isAutomobile)
+                            {
+                                finalOffset = rd->trackOffset[wheel] * multiplier;
+                                apply = true;
+                            }
+                        }
 
-                        ApplyBeltScroll(atomic->geometry, finalOffset);
-                        processed.insert(atomic->geometry);
+                        if (apply)
+                        {
+                            ApplyBeltScroll(atomic->geometry, finalOffset);
+                            processed.insert(atomic->geometry);
+                        }
+
                         return atomic;
                     },
                     &rd);
