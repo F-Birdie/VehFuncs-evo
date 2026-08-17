@@ -3,32 +3,79 @@
 #include "CVehicle.h"
 #include "RenderWare.h"
 #include "common.h"
+#include "NodeName.h"          // ← this is the key
+#include <unordered_map>
+#include <vector>
+#include <cstring>
+#include <cstdlib>
 
 using namespace plugin;
 
-float g_beltOffset = 0.0f;
-const float BELT_SPEED = 0.45f;   // adjust this value for speed
+const float DEFAULT_BELT_SPEED = 0.012f;
 
-void OffsetGeometryUVs(RpGeometry* geometry, float offsetX)
+struct OriginalUVs
 {
-    if (!geometry)
+    std::vector<RwTexCoords> uvs;
+};
+
+static std::unordered_map<RpGeometry*, OriginalUVs> g_originalUVs;
+static float g_beltOffset = 0.0f;
+
+void ApplyBeltScroll(RpGeometry* geometry, float offset)
+{
+    if (!geometry || !geometry->texCoords[0])
         return;
 
-    // Most reliable way across plugin-sdk versions
-    RwTexCoords* texCoords = geometry->texCoords[0];
-    if (!texCoords)
-        return;
+    if (g_originalUVs.find(geometry) == g_originalUVs.end())
+    {
+        OriginalUVs data;
+        data.uvs.resize(geometry->numVertices);
 
-    const RwInt32 numVerts = geometry->numVertices;
+        RwTexCoords* src = geometry->texCoords[0];
+        for (RwInt32 i = 0; i < geometry->numVertices; ++i)
+            data.uvs[i] = src[i];
+
+        g_originalUVs[geometry] = std::move(data);
+    }
+
+    const auto& original = g_originalUVs[geometry].uvs;
+    RwTexCoords* dst = geometry->texCoords[0];
+
+    float wrapped = offset - floorf(offset);
 
     RpGeometryLock(geometry, rpGEOMETRYLOCKTEXCOORDS);
 
-    for (RwInt32 i = 0; i < numVerts; ++i)
+    for (RwInt32 i = 0; i < geometry->numVertices; ++i)
     {
-        texCoords[i].u += offsetX;
+        dst[i].u = original[i].u + wrapped;
+        dst[i].v = original[i].v;
     }
 
     RpGeometryUnlock(geometry);
+}
+
+float GetBeltSpeedMultiplier(const char* name)
+{
+    if (!name) return 1.0f;
+
+    const char* mu = strstr(name, "_mu=");
+    if (!mu) return 1.0f;
+
+    return static_cast<float>(atof(mu + 4));
+}
+
+// Walk up the parent chain looking for a frame that starts with "f_belt"
+const char* FindBeltNodeName(RwFrame* frame)
+{
+    while (frame)
+    {
+        char* name = GetFrameNodeName(frame);   // from NodeName.h
+        if (name && _strnicmp(name, "f_belt", 6) == 0)
+            return name;
+
+        frame = RwFrameGetParent(frame);
+    }
+    return nullptr;
 }
 
 class FBeltScroller
@@ -41,42 +88,23 @@ public:
                 if (!vehicle || !vehicle->m_pRwClump)
                     return;
 
-                const float delta = CTimer::ms_fTimeStep * BELT_SPEED;
-
-                g_beltOffset += delta;
-                if (g_beltOffset > 1000.0f)
-                    g_beltOffset -= 1000.0f;
+                g_beltOffset += CTimer::ms_fTimeStep * DEFAULT_BELT_SPEED;
 
                 RpClumpForAllAtomics(vehicle->m_pRwClump,
-                    [](RpAtomic* atomic, void* data) -> RpAtomic*
+                    [](RpAtomic* atomic, void*) -> RpAtomic*
                     {
-                        float delta = *static_cast<float*>(data);
-
                         if (!atomic || !atomic->geometry)
                             return atomic;
 
-                        bool hasBelt = false;
+                        const char* name = FindBeltNodeName(RpAtomicGetFrame(atomic));
+                        if (!name)
+                            return atomic;
 
-                        RpGeometryForAllMaterials(atomic->geometry,
-                            [](RpMaterial* mat, void* data) -> RpMaterial*
-                            {
-                                bool* found = static_cast<bool*>(data);
-                                if (mat && mat->texture && _stricmp(mat->texture->name, "f_belt") == 0)
-                                {
-                                    *found = true;
-                                }
-                                return mat;
-                            },
-                            &hasBelt);
-
-                        if (hasBelt)
-                        {
-                            OffsetGeometryUVs(atomic->geometry, delta);
-                        }
+                        float multiplier = GetBeltSpeedMultiplier(name);
+                        ApplyBeltScroll(atomic->geometry, g_beltOffset * multiplier);
 
                         return atomic;
-                    },
-                    const_cast<float*>(&delta));   // pass delta safely
+                    }, nullptr);
             };
     }
 } fBeltScroller;
