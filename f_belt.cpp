@@ -13,16 +13,26 @@
 using namespace plugin;
 
 const float DEFAULT_BELT_SPEED = 0.012f;
+const float GAS_BOOST = 0.020f;   // how much faster it gets at full gas
 
 struct OriginalUVs
 {
     std::vector<RwTexCoords> uvs;
 };
 
-static std::unordered_map<RpGeometry*, OriginalUVs> g_originalUVs;
-static std::unordered_map<int, float> g_modelOffsets;
+struct BeltRenderData
+{
+    float constantOffset;
+    float gasOffset;
+};
 
-// Used to make sure we only advance each model once per frame
+static std::unordered_map<RpGeometry*, OriginalUVs> g_originalUVs;
+
+// Two separate running offsets per model
+static std::unordered_map<int, float> g_constantOffsets;
+static std::unordered_map<int, float> g_gasOffsets;
+
+static std::unordered_map<int, int> g_modelRefCount;
 static std::unordered_set<int> g_advancedThisFrame;
 static unsigned int g_lastFrameCounter = 0;
 
@@ -67,6 +77,11 @@ float GetBeltSpeedMultiplier(const char* name)
     return static_cast<float>(atof(mu + 4));
 }
 
+bool IsGasBelt(const char* name)
+{
+    return name && _strnicmp(name, "f_beltg", 7) == 0;
+}
+
 const char* FindBeltNodeName(RwFrame* frame)
 {
     while (frame)
@@ -84,14 +99,37 @@ class FBeltScroller
 public:
     FBeltScroller()
     {
+        Events::vehicleSetModelEvent += [](CVehicle* vehicle, int modelId)
+            {
+                g_modelRefCount[modelId]++;
+            };
+
+        Events::vehicleDtorEvent.before += [](CVehicle* vehicle)
+            {
+                int modelId = vehicle->m_nModelIndex;
+                auto it = g_modelRefCount.find(modelId);
+                if (it != g_modelRefCount.end())
+                {
+                    it->second--;
+                    if (it->second <= 0)
+                    {
+                        g_modelRefCount.erase(it);
+                        g_constantOffsets.erase(modelId);
+                        g_gasOffsets.erase(modelId);
+                    }
+                }
+            };
+
         Events::vehicleRenderEvent.before += [](CVehicle* vehicle)
             {
                 if (!vehicle || !vehicle->m_pRwClump)
                     return;
 
+                if (!vehicle->bEngineOn)
+                    return;
+
                 const int modelId = vehicle->m_nModelIndex;
 
-                // Detect new frame
                 unsigned int currentFrame = CTimer::m_FrameCounter;
                 if (currentFrame != g_lastFrameCounter)
                 {
@@ -99,23 +137,33 @@ public:
                     g_lastFrameCounter = currentFrame;
                 }
 
-                // Advance this model only once per frame
+                // Advance the two offsets only once per model per frame
                 if (g_advancedThisFrame.find(modelId) == g_advancedThisFrame.end())
                 {
-                    g_modelOffsets[modelId] += CTimer::ms_fTimeStep * DEFAULT_BELT_SPEED;
+                    float dt = CTimer::ms_fTimeStep;
+
+                    // Constant belts always run at base speed
+                    g_constantOffsets[modelId] += dt * DEFAULT_BELT_SPEED;
+
+                    // Gas belts run at base speed + extra from gas pedal
+                    float gas = fabsf(vehicle->m_fGasPedal);          // 0.0 → 1.0
+                    float gasSpeed = DEFAULT_BELT_SPEED + gas * GAS_BOOST;
+                    g_gasOffsets[modelId] += dt * gasSpeed;
+
                     g_advancedThisFrame.insert(modelId);
                 }
 
-                float offset = g_modelOffsets[modelId];
+                BeltRenderData rd;
+                rd.constantOffset = g_constantOffsets[modelId];
+                rd.gasOffset = g_gasOffsets[modelId];
 
-                // Process geometries only once per frame
                 static std::unordered_set<RpGeometry*> processed;
                 processed.clear();
 
                 RpClumpForAllAtomics(vehicle->m_pRwClump,
                     [](RpAtomic* atomic, void* data) -> RpAtomic*
                     {
-                        float offset = *static_cast<float*>(data);
+                        BeltRenderData* rd = static_cast<BeltRenderData*>(data);
 
                         if (!atomic || !atomic->geometry)
                             return atomic;
@@ -128,12 +176,18 @@ public:
                             return atomic;
 
                         float multiplier = GetBeltSpeedMultiplier(name);
-                        ApplyBeltScroll(atomic->geometry, offset * multiplier);
 
+                        float finalOffset;
+                        if (IsGasBelt(name))
+                            finalOffset = rd->gasOffset * multiplier;
+                        else
+                            finalOffset = rd->constantOffset * multiplier;
+
+                        ApplyBeltScroll(atomic->geometry, finalOffset);
                         processed.insert(atomic->geometry);
                         return atomic;
                     },
-                    &offset);
+                    &rd);
             };
     }
 } fBeltScroller;
