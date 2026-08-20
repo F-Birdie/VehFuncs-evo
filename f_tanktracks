@@ -1,0 +1,182 @@
+#include "plugin.h"
+#include "CTimer.h"
+#include "CVehicle.h"
+#include "CAutomobile.h"
+#include "RenderWare.h"
+#include "common.h"
+#include "NodeName.h"
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+#include <cstring>
+#include <cstdlib>
+#include <cmath>
+
+using namespace plugin;
+
+// ===================== TRACK TUNABLES =====================
+const float TRACK_SCALE = 0.15f;
+const float TRACK_STRETCH_MIN = 0.80f;
+const float TRACK_STRETCH_MAX = 1.10f;
+// ==========================================================
+
+struct TrackOriginalUVs
+{
+    std::vector<RwTexCoords> uvs;
+};
+
+struct TrackOriginalMatrix
+{
+    RwMatrix mat;
+    bool stored = false;
+};
+
+struct TrackRenderData
+{
+    CAutomobile* automobile;
+};
+
+static std::unordered_map<RpGeometry*, TrackOriginalUVs> g_trackUVs;
+static std::unordered_map<RwFrame*, TrackOriginalMatrix> g_trackMatrices;
+
+void ApplyTrackScroll(RpGeometry* geometry, float offset)
+{
+    if (!geometry || !geometry->texCoords[0])
+        return;
+
+    if (g_trackUVs.find(geometry) == g_trackUVs.end())
+    {
+        TrackOriginalUVs data;
+        data.uvs.resize(geometry->numVertices);
+        RwTexCoords* src = geometry->texCoords[0];
+        for (RwInt32 i = 0; i < geometry->numVertices; ++i)
+            data.uvs[i] = src[i];
+        g_trackUVs[geometry] = std::move(data);
+    }
+
+    const auto& original = g_trackUVs[geometry].uvs;
+    RwTexCoords* dst = geometry->texCoords[0];
+    float wrapped = offset - floorf(offset);
+
+    RpGeometryLock(geometry, rpGEOMETRYLOCKTEXCOORDS);
+    for (RwInt32 i = 0; i < geometry->numVertices; ++i)
+    {
+        dst[i].u = original[i].u + wrapped;
+        dst[i].v = original[i].v;
+    }
+    RpGeometryUnlock(geometry);
+}
+
+void ApplyTrackStretch(RwFrame* frame, float compression)
+{
+    if (!frame) return;
+
+    auto& entry = g_trackMatrices[frame];
+    if (!entry.stored)
+    {
+        entry.mat = *RwFrameGetMatrix(frame);
+        entry.stored = true;
+    }
+
+    float t = compression;
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+
+    float scale = TRACK_STRETCH_MIN + t * (TRACK_STRETCH_MAX - TRACK_STRETCH_MIN);
+
+    RwMatrix* mat = RwFrameGetMatrix(frame);
+    *mat = entry.mat;
+
+    mat->at.x *= scale;
+    mat->at.y *= scale;
+    mat->at.z *= scale;
+
+    RwMatrixUpdate(mat);
+    RwFrameUpdateObjects(frame);
+}
+
+float GetTrackMultiplier(const char* name)
+{
+    if (!name) return 1.0f;
+    const char* mu = strstr(name, "_mu=");
+    if (!mu) return 1.0f;
+    return static_cast<float>(atof(mu + 4));
+}
+
+int GetTrackWheel(const char* name)
+{
+    if (!name) return -1;
+    if (_strnicmp(name, "f_track_lf", 10) == 0) return 0;
+    if (_strnicmp(name, "f_track_lb", 10) == 0) return 1;
+    if (_strnicmp(name, "f_track_rf", 10) == 0) return 2;
+    if (_strnicmp(name, "f_track_rb", 10) == 0) return 3;
+    return -1;
+}
+
+const char* FindTrackNode(RwFrame* frame)
+{
+    while (frame)
+    {
+        char* name = GetFrameNodeName(frame);
+        if (name && _strnicmp(name, "f_track", 7) == 0)
+            return name;
+        frame = RwFrameGetParent(frame);
+    }
+    return nullptr;
+}
+
+class TankTracks
+{
+public:
+    TankTracks()
+    {
+        Events::vehicleRenderEvent.before += [](CVehicle* vehicle)
+            {
+                if (!vehicle || !vehicle->m_pRwClump)
+                    return;
+
+                if (vehicle->m_nVehicleClass != VEHICLE_AUTOMOBILE &&
+                    vehicle->m_nVehicleClass != VEHICLE_MTRUCK &&
+                    vehicle->m_nVehicleClass != VEHICLE_QUAD)
+                    return;
+
+                TrackRenderData data;
+                data.automobile = static_cast<CAutomobile*>(vehicle);
+
+                static std::unordered_set<RpGeometry*> processed;
+                processed.clear();
+
+                RpClumpForAllAtomics(vehicle->m_pRwClump,
+                    [](RpAtomic* atomic, void* userdata) -> RpAtomic*
+                    {
+                        TrackRenderData* data = static_cast<TrackRenderData*>(userdata);
+                        CAutomobile* automobile = data->automobile;
+
+                        if (!atomic || !atomic->geometry)
+                            return atomic;
+
+                        if (processed.count(atomic->geometry))
+                            return atomic;
+
+                        RwFrame* frame = RpAtomicGetFrame(atomic);
+                        const char* name = FindTrackNode(frame);
+                        if (!name)
+                            return atomic;
+
+                        int wheel = GetTrackWheel(name);
+                        if (wheel < 0)
+                            return atomic;
+
+                        float mult = GetTrackMultiplier(name);
+                        float offset = automobile->m_fWheelRotation[wheel] * TRACK_SCALE * mult;
+
+                        ApplyTrackScroll(atomic->geometry, offset);
+                        ApplyTrackStretch(frame, automobile->m_fWheelsSuspensionCompression[wheel]);
+
+                        processed.insert(atomic->geometry);
+                        return atomic;
+                    },
+                    &data);
+            };
+    }
+} tankTracks;
