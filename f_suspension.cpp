@@ -8,7 +8,12 @@
 
 using namespace plugin;
 
-const float ROTATION_PER_UNIT = 80.0f;   // degrees per unit of Z travel
+// ===================== TUNABLE =====================
+const float ROTATION_PER_UNIT = 120.0f;
+const float STRETCH_PER_UNIT = -1.5f;
+const float STRETCH_MIN = 0.70f;
+const float STRETCH_MAX = 1.35f;
+// ===================================================
 
 struct SuspOriginalMatrix
 {
@@ -25,7 +30,7 @@ struct WheelRestZ
 static std::unordered_map<RwFrame*, SuspOriginalMatrix> g_suspMatrices;
 static std::unordered_map<CVehicle*, WheelRestZ> g_wheelRestZ;
 
-void ApplySuspensionRotation(RwFrame* frame, float angle)
+void ApplySuspensionTransform(RwFrame* frame, float angle, float scale)
 {
     if (!frame) return;
 
@@ -39,8 +44,14 @@ void ApplySuspensionRotation(RwFrame* frame, float angle)
     RwMatrix* mat = RwFrameGetMatrix(frame);
     *mat = entry.mat;
 
+    // Rotate
     RwV3d axis = { 0.0f, 1.0f, 0.0f };
     RwMatrixRotate(mat, &axis, angle, rwCOMBINEPRECONCAT);
+
+    // Stretch
+    mat->at.x *= scale;
+    mat->at.y *= scale;
+    mat->at.z *= scale;
 
     RwMatrixUpdate(mat);
     RwFrameUpdateObjects(frame);
@@ -56,7 +67,6 @@ SuspInfo GetSuspensionInfo(const char* name)
 {
     if (!name) return { -1, 1.0f };
 
-    // Using the signs you found work
     if (_strnicmp(name, "suspension_lf", 13) == 0) return { 0,  1.0f };
     if (_strnicmp(name, "suspension_rf", 13) == 0) return { 2, -1.0f };
     if (_strnicmp(name, "suspension_lr", 13) == 0) return { 1,  1.0f };
@@ -79,77 +89,83 @@ eCarNodes WheelToNode(int wheel)
     }
 }
 
-class SuspensionRotate
+class SuspensionTransform
 {
 public:
-    SuspensionRotate()
+    SuspensionTransform()
     {
         Events::vehicleDtorEvent.before += [](CVehicle* vehicle)
-        {
-            g_wheelRestZ.erase(vehicle);
-        };
+            {
+                g_wheelRestZ.erase(vehicle);
+            };
 
         Events::vehicleRenderEvent.before += [](CVehicle* vehicle)
-        {
-            if (!vehicle || !vehicle->m_pRwClump)
-                return;
-
-            if (vehicle->m_nVehicleClass != VEHICLE_AUTOMOBILE &&
-                vehicle->m_nVehicleClass != VEHICLE_MTRUCK &&
-                vehicle->m_nVehicleClass != VEHICLE_QUAD)
-                return;
-
-            CAutomobile* autoMobile = static_cast<CAutomobile*>(vehicle);
-
-            WheelRestZ& rest = g_wheelRestZ[vehicle];
-            if (!rest.initialized)
             {
-                for (int i = 0; i < 4; ++i)
+                if (!vehicle || !vehicle->m_pRwClump)
+                    return;
+
+                if (vehicle->m_nVehicleClass != VEHICLE_AUTOMOBILE &&
+                    vehicle->m_nVehicleClass != VEHICLE_MTRUCK &&
+                    vehicle->m_nVehicleClass != VEHICLE_QUAD)
+                    return;
+
+                CAutomobile* autoMobile = static_cast<CAutomobile*>(vehicle);
+
+                WheelRestZ& rest = g_wheelRestZ[vehicle];
+                if (!rest.initialized)
                 {
-                    RwFrame* wheelFrame = autoMobile->m_aCarNodes[WheelToNode(i)];
-                    if (wheelFrame)
-                        rest.z[i] = RwFrameGetMatrix(wheelFrame)->pos.z;
-                    else
-                        rest.z[i] = 0.0f;
+                    for (int i = 0; i < 4; ++i)
+                    {
+                        RwFrame* wheelFrame = autoMobile->m_aCarNodes[WheelToNode(i)];
+                        if (wheelFrame)
+                            rest.z[i] = RwFrameGetMatrix(wheelFrame)->pos.z;
+                        else
+                            rest.z[i] = 0.0f;
+                    }
+                    rest.initialized = true;
                 }
-                rest.initialized = true;
-            }
 
-            struct Data {
-                CAutomobile* autoMobile;
-                WheelRestZ* rest;
-            } data = { autoMobile, &rest };
+                struct Data {
+                    CAutomobile* autoMobile;
+                    WheelRestZ* rest;
+                } data = { autoMobile, &rest };
 
-            RpClumpForAllAtomics(vehicle->m_pRwClump,
-                [](RpAtomic* atomic, void* userdata) -> RpAtomic*
-                {
-                    Data* d = static_cast<Data*>(userdata);
-                    if (!atomic) return atomic;
+                RpClumpForAllAtomics(vehicle->m_pRwClump,
+                    [](RpAtomic* atomic, void* userdata) -> RpAtomic*
+                    {
+                        Data* d = static_cast<Data*>(userdata);
+                        if (!atomic) return atomic;
 
-                    RwFrame* frame = RpAtomicGetFrame(atomic);
-                    if (!frame) return atomic;
+                        RwFrame* frame = RpAtomicGetFrame(atomic);
+                        if (!frame) return atomic;
 
-                    char* name = GetFrameNodeName(frame);
-                    if (!name || _strnicmp(name, "suspension_", 11) != 0)
+                        char* name = GetFrameNodeName(frame);
+                        if (!name || _strnicmp(name, "suspension_", 11) != 0)
+                            return atomic;
+
+                        SuspInfo info = GetSuspensionInfo(name);
+                        if (info.wheel < 0) return atomic;
+
+                        RwFrame* wheelFrame = d->autoMobile->m_aCarNodes[WheelToNode(info.wheel)];
+                        if (!wheelFrame) return atomic;
+
+                        float currentZ = RwFrameGetMatrix(wheelFrame)->pos.z;
+                        float restZ = d->rest->z[info.wheel];
+                        float delta = currentZ - restZ;
+
+                        // Rotation (already has correct sign)
+                        float angle = delta * ROTATION_PER_UNIT * info.sign;
+
+                        // Stretch – now also uses the same sign
+                        float scale = 1.0f + (delta * STRETCH_PER_UNIT * info.sign);
+                        if (scale < STRETCH_MIN) scale = STRETCH_MIN;
+                        if (scale > STRETCH_MAX) scale = STRETCH_MAX;
+
+                        ApplySuspensionTransform(frame, angle, scale);
+
                         return atomic;
-
-                    SuspInfo info = GetSuspensionInfo(name);
-                    if (info.wheel < 0) return atomic;
-
-                    RwFrame* wheelFrame = d->autoMobile->m_aCarNodes[WheelToNode(info.wheel)];
-                    if (!wheelFrame) return atomic;
-
-                    float currentZ = RwFrameGetMatrix(wheelFrame)->pos.z;
-                    float restZ = d->rest->z[info.wheel];
-
-                    float delta = currentZ - restZ;
-                    float angle = delta * ROTATION_PER_UNIT * info.sign;
-
-                    ApplySuspensionRotation(frame, angle);
-
-                    return atomic;
-                },
-                &data);
-        };
+                    },
+                    &data);
+            };
     }
-} suspensionRotate;
+} suspensionTransform;
