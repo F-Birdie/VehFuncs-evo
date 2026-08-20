@@ -1,0 +1,130 @@
+#include "plugin.h"
+#include "CPlane.h"
+#include "RenderWare.h"
+#include "NodeName.h"
+#include "common.h"
+#include <cstring>
+
+using namespace plugin;
+
+struct RestMat {
+    bool  valid = false;
+    RwV3d right{}, up{}, at{}, pos{};
+};
+
+static RestMat restL, restR, restL2, restR2;
+
+static RwFrame* FindFrameByName(RwFrame* root, const char* name) {
+    if (!root || !name)
+        return nullptr;
+    if (const char* n = GetFrameNodeName(root)) {
+        if (std::strcmp(n, name) == 0)
+            return root;
+    }
+    for (RwFrame* c = root->child; c; c = c->next) {
+        if (RwFrame* f = FindFrameByName(c, name))
+            return f;
+    }
+    return nullptr;
+}
+
+static void SaveRest(RwFrame* f, RestMat& out) {
+    if (!f || out.valid)
+        return;
+    RwMatrix* m = RwFrameGetMatrix(f);
+    if (!m)
+        return;
+    out.right = m->right;
+    out.up = m->up;
+    out.at = m->at;
+    out.pos = m->pos;
+    out.valid = true;
+}
+
+// current = rest * delta  =>  apply same delta to dst: dst = dstRest * delta
+// Keeps dst position (pivot); only orientation is copied from stock aileron.
+static void CopyOrientDelta(RwFrame* src, const RestMat& srcRest,
+    RwFrame* dst, const RestMat& dstRest) {
+    if (!src || !dst || !srcRest.valid || !dstRest.valid)
+        return;
+
+    RwMatrix* sm = RwFrameGetMatrix(src);
+    RwMatrix* dm = RwFrameGetMatrix(dst);
+    if (!sm || !dm)
+        return;
+
+    // Build 3x3 rest and current for src
+    // delta = inv(srcRest) * srcCurrent
+    // For orthonormal rotation: inv = transpose
+    const float r00 = srcRest.right.x, r01 = srcRest.up.x, r02 = srcRest.at.x;
+    const float r10 = srcRest.right.y, r11 = srcRest.up.y, r12 = srcRest.at.y;
+    const float r20 = srcRest.right.z, r21 = srcRest.up.z, r22 = srcRest.at.z;
+
+    // invRest * sm->right (column)
+    auto mulInvRest = [&](RwV3d v) -> RwV3d {
+        return {
+            r00 * v.x + r10 * v.y + r20 * v.z,
+            r01 * v.x + r11 * v.y + r21 * v.z,
+            r02 * v.x + r12 * v.y + r22 * v.z
+        };
+        };
+
+    RwV3d dRight = mulInvRest(sm->right);
+    RwV3d dUp = mulInvRest(sm->up);
+    RwV3d dAt = mulInvRest(sm->at);
+
+    // dstOrient = dstRest * delta
+    auto mulDstRest = [&](RwV3d v) -> RwV3d {
+        return {
+            dstRest.right.x * v.x + dstRest.up.x * v.y + dstRest.at.x * v.z,
+            dstRest.right.y * v.x + dstRest.up.y * v.y + dstRest.at.y * v.z,
+            dstRest.right.z * v.x + dstRest.up.z * v.y + dstRest.at.z * v.z
+        };
+        };
+
+    dm->right = mulDstRest(dRight);
+    dm->up = mulDstRest(dUp);
+    dm->at = mulDstRest(dAt);
+
+    // Keep l2/r2 pivot where the model put it
+    dm->pos = dstRest.pos;
+
+    RwMatrixUpdate(dm);
+    RwFrameUpdateObjects(dst);
+}
+
+class AileronL2R2 {
+public:
+    AileronL2R2() {
+        Events::vehicleRenderEvent += [](CVehicle* veh) {
+            if (!veh || !veh->m_pRwClump)
+                return;
+            if (veh->m_nModelIndex != MODEL_HYDRA)
+                return;
+
+            auto* plane = static_cast<CPlane*>(veh);
+
+            RwFrame* al = plane->m_aCarNodes[PLANE_AILERON_L];
+            RwFrame* ar = plane->m_aCarNodes[PLANE_AILERON_R];
+            if (!al || !ar)
+                return;
+
+            RwFrame* root = RpClumpGetFrame(veh->m_pRwClump);
+            RwFrame* l2 = FindFrameByName(root, "aileron_l2");
+            RwFrame* r2 = FindFrameByName(root, "aileron_r2");
+            if (!l2 || !r2)
+                return;
+
+            // Rest = neutral pose (first time we see them)
+            SaveRest(al, restL);
+            SaveRest(ar, restR);
+            SaveRest(l2, restL2);
+            SaveRest(r2, restR2);
+
+            // Game already rotated al/ar in PreRender (aileron_pos hinge + local axis).
+            // Copy that same orientation delta onto l2/r2.
+            CopyOrientDelta(al, restL, l2, restL2);
+            CopyOrientDelta(ar, restR, r2, restR2);
+            };
+    }
+} aileronL2R2;
