@@ -16,6 +16,156 @@ using namespace plugin;
 static constexpr int DUMMY_EXHAUST = 9;
 static constexpr float DEG2RAD = 3.14159265f / 180.0f;
 
+// =====================================================================
+// Shared helpers
+// =====================================================================
+
+static RwFrame* FindFrameByName(RwFrame* root, const char* name) {
+    if (!root || !name)
+        return nullptr;
+    if (const char* n = GetFrameNodeName(root)) {
+        if (std::strcmp(n, name) == 0)
+            return root;
+    }
+    for (RwFrame* c = root->child; c; c = c->next) {
+        if (RwFrame* f = FindFrameByName(c, name))
+            return f;
+    }
+    return nullptr;
+}
+
+// =====================================================================
+// 1) Extra ailerons (aileron_l2 / aileron_r2)
+// =====================================================================
+
+struct RestMat {
+    bool valid = false;
+    RwV3d right{}, up{}, at{}, pos{};
+};
+
+static RestMat restL, restR, restL2, restR2;
+
+static void SaveRest(RwFrame* f, RestMat& out) {
+    if (!f || out.valid)
+        return;
+    RwMatrix* m = RwFrameGetMatrix(f);
+    if (!m)
+        return;
+    out.right = m->right;
+    out.up = m->up;
+    out.at = m->at;
+    out.pos = m->pos;
+    out.valid = true;
+}
+
+static void CopyOrientDelta(RwFrame* src, const RestMat& srcRest,
+    RwFrame* dst, const RestMat& dstRest) {
+    if (!src || !dst || !srcRest.valid || !dstRest.valid)
+        return;
+    RwMatrix* sm = RwFrameGetMatrix(src);
+    RwMatrix* dm = RwFrameGetMatrix(dst);
+    if (!sm || !dm)
+        return;
+
+    const float r00 = srcRest.right.x, r01 = srcRest.up.x, r02 = srcRest.at.x;
+    const float r10 = srcRest.right.y, r11 = srcRest.up.y, r12 = srcRest.at.y;
+    const float r20 = srcRest.right.z, r21 = srcRest.up.z, r22 = srcRest.at.z;
+
+    auto mulInvRest = [&](RwV3d v) -> RwV3d {
+        return {
+            r00 * v.x + r10 * v.y + r20 * v.z,
+            r01 * v.x + r11 * v.y + r21 * v.z,
+            r02 * v.x + r12 * v.y + r22 * v.z
+        };
+        };
+
+    RwV3d dRight = mulInvRest(sm->right);
+    RwV3d dUp = mulInvRest(sm->up);
+    RwV3d dAt = mulInvRest(sm->at);
+
+    auto mulDstRest = [&](RwV3d v) -> RwV3d {
+        return {
+            dstRest.right.x * v.x + dstRest.up.x * v.y + dstRest.at.x * v.z,
+            dstRest.right.y * v.x + dstRest.up.y * v.y + dstRest.at.y * v.z,
+            dstRest.right.z * v.x + dstRest.up.z * v.y + dstRest.at.z * v.z
+        };
+        };
+
+    dm->right = mulDstRest(dRight);
+    dm->up = mulDstRest(dUp);
+    dm->at = mulDstRest(dAt);
+    dm->pos = dstRest.pos;
+
+    RwMatrixUpdate(dm);
+    RwFrameUpdateObjects(dst);
+}
+
+class AileronL2R2 {
+public:
+    AileronL2R2() {
+        Events::vehicleRenderEvent += [](CVehicle* veh) {
+            if (!veh || !veh->m_pRwClump)
+                return;
+            if (veh->m_nModelIndex != MODEL_HYDRA)
+                return;
+
+            auto* plane = static_cast<CPlane*>(veh);
+            RwFrame* al = plane->m_aCarNodes[PLANE_AILERON_L];
+            RwFrame* ar = plane->m_aCarNodes[PLANE_AILERON_R];
+            if (!al || !ar)
+                return;
+
+            RwFrame* root = RpClumpGetFrame(veh->m_pRwClump);
+            RwFrame* l2 = FindFrameByName(root, "aileron_l2");
+            RwFrame* r2 = FindFrameByName(root, "aileron_r2");
+            if (!l2 || !r2)
+                return;
+
+            SaveRest(al, restL);
+            SaveRest(ar, restR);
+            SaveRest(l2, restL2);
+            SaveRest(r2, restR2);
+
+            CopyOrientDelta(al, restL, l2, restL2);
+            CopyOrientDelta(ar, restR, r2, restR2);
+            };
+    }
+} aileronL2R2;
+
+// =====================================================================
+// 2) Stock jet-fume offsets (m_apJettrusParticles)
+// =====================================================================
+
+static CVector JetOffset[4] = {
+    { -1.20f, -2.50f,  0.25f },
+    {  1.20f, -2.50f,  0.25f },
+    { -1.20f, -2.50f, -0.25f },
+    {  1.20f, -2.50f, -0.25f },
+};
+
+class HydraJetFumes {
+public:
+    HydraJetFumes() {
+        Events::vehicleRenderEvent += [](CVehicle* veh) {
+            if (!veh || veh->m_nModelIndex != MODEL_HYDRA)
+                return;
+
+            auto* plane = static_cast<CPlane*>(veh);
+            for (int i = 0; i < 4; i++) {
+                FxSystem_c* fx = plane->m_apJettrusParticles[i];
+                if (!fx)
+                    continue;
+                RwV3d off = { JetOffset[i].x, JetOffset[i].y, JetOffset[i].z };
+                fx->SetOffsetPos(&off);
+            }
+            };
+    }
+} hydraJetFumes;
+
+// =====================================================================
+// 3) Rear exhaust (jetthrust / nitro / flame)
+// =====================================================================
+
 // ===================== IDLE ========================
 static constexpr float IDLE_JT_RATE = 1.0f;
 static constexpr float IDLE_JT_PITCH_DEG = 0.0f;
@@ -42,20 +192,6 @@ static FxSystem_c* g_fxJT = nullptr;
 static CVehicle* g_bound = nullptr;
 static RwMatrix    g_nitroParent;
 static RwMatrix    g_jtParent;
-
-static RwFrame* FindFrameByName(RwFrame* root, const char* name) {
-    if (!root || !name)
-        return nullptr;
-    if (const char* n = GetFrameNodeName(root)) {
-        if (std::strcmp(n, name) == 0)
-            return root;
-    }
-    for (RwFrame* c = root->child; c; c = c->next) {
-        if (RwFrame* f = FindFrameByName(c, name))
-            return f;
-    }
-    return nullptr;
-}
 
 static bool GetExhaustLocalPos(CVehicle* veh, CVector& out) {
     if (veh->m_pRwClump) {
@@ -171,7 +307,6 @@ static void UpdatePitched(FxSystem_c* fx, RwV3d* exhaustOff, RwMatrix* vehMat,
     fx->SetConstTime(1, constTime);
 }
 
-// CPad::GetAccelerate() — short, > 0 means gas
 static bool IsHoldingGas(CVehicle* veh) {
     CVehicle* playerVeh = FindPlayerVehicle(-1, false);
     if (!playerVeh || playerVeh != veh)
@@ -184,16 +319,7 @@ static bool IsHoldingGas(CVehicle* veh) {
     return pad->GetAccelerate() > 0;
 }
 
-// How far through the hover->jet nozzle sweep before the effect kicks in.
-// 0.0 = trigger almost immediately (still near hover), 1.0 = only once
-// fully rotated. Tune to taste.
 static constexpr float JET_MODE_TRIGGER_FRACTION = 0.5f;
-
-// Measured directly from hydra_nozzle_debug.log: angle=5000 at hover,
-// angle=0 at full jet, smooth linear transition between them.
-// CPlane::HARRIER_NOZZLE_ROTATE_LIMIT/SWITCH_LIMIT read as 0.000 in this
-// build (their StaticRef addresses aren't resolving to real data here),
-// so we use the measured constants instead rather than those broken refs.
 static constexpr float NOZZLE_HOVER_ANGLE = 5000.0f;
 static constexpr float NOZZLE_JET_ANGLE = 0.0f;
 
