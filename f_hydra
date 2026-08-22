@@ -10,8 +10,6 @@
 #include "common.h"
 #include <cstring>
 #include <cmath>
-#include <unordered_map>
-#include <memory>
 
 using namespace plugin;
 
@@ -37,7 +35,7 @@ static RwFrame* FindFrameByName(RwFrame* root, const char* name) {
 }
 
 // =====================================================================
-// 1) Extra ailerons — per-vehicle rest poses
+// 1) Extra ailerons (aileron_l2 / aileron_r2)
 // =====================================================================
 
 struct RestMat {
@@ -45,11 +43,7 @@ struct RestMat {
     RwV3d right{}, up{}, at{}, pos{};
 };
 
-struct AileronRest {
-    RestMat restL, restR, restL2, restR2;
-};
-
-static std::unordered_map<CVehicle*, AileronRest> g_aileronRests;
+static RestMat restL, restR, restL2, restR2;
 
 static void SaveRest(RwFrame* f, RestMat& out) {
     if (!f || out.valid)
@@ -65,7 +59,7 @@ static void SaveRest(RwFrame* f, RestMat& out) {
 }
 
 static void CopyOrientDelta(RwFrame* src, const RestMat& srcRest,
-                            RwFrame* dst, const RestMat& dstRest) {
+    RwFrame* dst, const RestMat& dstRest) {
     if (!src || !dst || !srcRest.valid || !dstRest.valid)
         return;
     RwMatrix* sm = RwFrameGetMatrix(src);
@@ -83,11 +77,11 @@ static void CopyOrientDelta(RwFrame* src, const RestMat& srcRest,
             r01 * v.x + r11 * v.y + r21 * v.z,
             r02 * v.x + r12 * v.y + r22 * v.z
         };
-    };
+        };
 
     RwV3d dRight = mulInvRest(sm->right);
-    RwV3d dUp    = mulInvRest(sm->up);
-    RwV3d dAt    = mulInvRest(sm->at);
+    RwV3d dUp = mulInvRest(sm->up);
+    RwV3d dAt = mulInvRest(sm->at);
 
     auto mulDstRest = [&](RwV3d v) -> RwV3d {
         return {
@@ -95,12 +89,12 @@ static void CopyOrientDelta(RwFrame* src, const RestMat& srcRest,
             dstRest.right.y * v.x + dstRest.up.y * v.y + dstRest.at.y * v.z,
             dstRest.right.z * v.x + dstRest.up.z * v.y + dstRest.at.z * v.z
         };
-    };
+        };
 
     dm->right = mulDstRest(dRight);
-    dm->up    = mulDstRest(dUp);
-    dm->at    = mulDstRest(dAt);
-    dm->pos   = dstRest.pos;
+    dm->up = mulDstRest(dUp);
+    dm->at = mulDstRest(dAt);
+    dm->pos = dstRest.pos;
 
     RwMatrixUpdate(dm);
     RwFrameUpdateObjects(dst);
@@ -127,136 +121,153 @@ public:
             if (!l2 || !r2)
                 return;
 
-            AileronRest& rest = g_aileronRests[veh];
-            SaveRest(al, rest.restL);
-            SaveRest(ar, rest.restR);
-            SaveRest(l2, rest.restL2);
-            SaveRest(r2, rest.restR2);
+            SaveRest(al, restL);
+            SaveRest(ar, restR);
+            SaveRest(l2, restL2);
+            SaveRest(r2, restR2);
 
-            CopyOrientDelta(al, rest.restL, l2, rest.restL2);
-            CopyOrientDelta(ar, rest.restR, r2, rest.restR2);
-        };
-
-        Events::vehicleDtorEvent += [](CVehicle* veh) {
-            g_aileronRests.erase(veh);
-        };
+            CopyOrientDelta(al, restL, l2, restL2);
+            CopyOrientDelta(ar, restR, r2, restR2);
+            };
     }
 } aileronL2R2;
 
 // =====================================================================
-// 2) Stock jet-fume offsets
+// 2) Jet fumes
+//    Front pivot: wheel_lm_dummy  + thruster_f
+//    Rear pivot:  wheel_rm_dummy  + thruster_r
+//    0=RF 1=LF 2=RR 3=LR
 // =====================================================================
 
-static CVector JetOffset[4] = {
-    { -1.20f, -2.50f,  0.25f },
-    {  1.20f, -2.50f,  0.25f },
-    { -1.20f, -2.50f, -0.25f },
-    {  1.20f, -2.50f, -0.25f },
-};
+static bool GetNamedPos(RwFrame* root, const char* name, CVector& out) {
+    RwFrame* f = FindFrameByName(root, name);
+    if (!f)
+        return false;
+    RwMatrix* m = RwFrameGetMatrix(f);
+    if (!m)
+        return false;
+    out = { m->pos.x, m->pos.y, m->pos.z };
+    return true;
+}
+
+static RwV3d DeltaToOffset(const CVector& d) {
+    return { d.x, d.z, -d.y };
+}
 
 class HydraJetFumes {
 public:
     HydraJetFumes() {
         Events::vehicleRenderEvent += [](CVehicle* veh) {
-            if (!veh || veh->m_nModelIndex != MODEL_HYDRA)
+            if (!veh || veh->m_nModelIndex != MODEL_HYDRA || !veh->m_pRwClump)
                 return;
 
             auto* plane = static_cast<CPlane*>(veh);
+            RwFrame* root = RpClumpGetFrame(veh->m_pRwClump);
+            if (!root)
+                return;
+
+            CVector pivotF, pivotR, thrF, thrR;
+            if (!GetNamedPos(root, "wheel_lm_dummy", pivotF)) // FRONT pivot
+                return;
+            if (!GetNamedPos(root, "wheel_rm_dummy", pivotR)) // REAR pivot
+                return;
+            if (!GetNamedPos(root, "thruster_f", thrF))
+                return;
+            if (!GetNamedPos(root, "thruster_r", thrR))
+                return;
+
+            const CVector dF = {
+                thrF.x - pivotF.x,
+                thrF.y - pivotF.y,
+                thrF.z - pivotF.z
+            };
+            const CVector dR = {
+                thrR.x - pivotR.x,
+                thrR.y - pivotR.y,
+                thrR.z - pivotR.z
+            };
+
+            const RwV3d offs[4] = {
+                DeltaToOffset(dF),                      // 0 RF
+                DeltaToOffset({ -dF.x, dF.y, dF.z }), // 1 LF
+                DeltaToOffset(dR),                      // 2 RR
+                DeltaToOffset({ -dR.x, dR.y, dR.z }), // 3 LR
+            };
+
             for (int i = 0; i < 4; i++) {
                 FxSystem_c* fx = plane->m_apJettrusParticles[i];
                 if (!fx)
                     continue;
-                RwV3d off = { JetOffset[i].x, JetOffset[i].y, JetOffset[i].z };
+                RwV3d off = offs[i];
                 fx->SetOffsetPos(&off);
             }
-        };
+            };
     }
 } hydraJetFumes;
 
+
 // =====================================================================
-// 3) Rear exhaust — per-vehicle, stable parent matrix storage
+// 3) Rear exhaust (jetthrust / nitro / flame)
 // =====================================================================
 
-static constexpr float IDLE_JT_RATE       = 1.0f;
-static constexpr float IDLE_JT_PITCH_DEG  = 0.0f;
+// ===================== IDLE ========================
+static constexpr float IDLE_JT_RATE = 1.0f;
+static constexpr float IDLE_JT_PITCH_DEG = 0.0f;
 static constexpr float IDLE_JT_CONST_TIME = 0.5f;
+// ===================================================
 
-static constexpr float FULL_JT_RATE       = 1.0f;
-static constexpr float FULL_JT_PITCH_DEG  = 0.0f;
+// ===================== FULL THRUST =================
+static constexpr float FULL_JT_RATE = 1.0f;
+static constexpr float FULL_JT_PITCH_DEG = 0.0f;
 static constexpr float FULL_JT_CONST_TIME = 0.5f;
 
-static constexpr float FULL_NITRO_RATE       = 6.0f;
-static constexpr float FULL_NITRO_PITCH_DEG  = 0.0f;
+static constexpr float FULL_NITRO_RATE = 6.0f;
+static constexpr float FULL_NITRO_PITCH_DEG = 0.0f;
 static constexpr float FULL_NITRO_CONST_TIME = 0.5f;
 
 static constexpr float FULL_FLAME_SCALE = 2.0f;
-static constexpr float FULL_FLAME_RATE  = 1.0f;
-static constexpr float FULL_FLAME_AT_Y  = -1.0f;
+static constexpr float FULL_FLAME_RATE = 1.0f;
+static constexpr float FULL_FLAME_AT_Y = -1.0f;
+// ===================================================
 
-struct ExhaustState {
-    FxSystem_c* fxJT    = nullptr;
-    FxSystem_c* fxNitro = nullptr;
-    FxSystem_c* fxFlame = nullptr;
-    RwMatrix jtParent{};
-    RwMatrix nitroParent{};
-};
-
-// unique_ptr: map rehash must not move the matrices Fx systems point at
-static std::unordered_map<CVehicle*, std::unique_ptr<ExhaustState>> g_exhaustStates;
+static FxSystem_c* g_fxNitro = nullptr;
+static FxSystem_c* g_fxFlame = nullptr;
+static FxSystem_c* g_fxJT = nullptr;
+static CVehicle* g_bound = nullptr;
+static RwMatrix    g_nitroParent;
+static RwMatrix    g_jtParent;
 
 static bool GetExhaustLocalPos(CVehicle* veh, CVector& out) {
-    if (veh->m_pRwClump) {
-        RwFrame* root = RpClumpGetFrame(veh->m_pRwClump);
-        if (RwFrame* exh = FindFrameByName(root, "exhaust")) {
-            if (RwMatrix* m = RwFrameGetMatrix(exh)) {
-                out = { m->pos.x, m->pos.y, m->pos.z };
-                return true;
-            }
-        }
-    }
     auto* mi = static_cast<CVehicleModelInfo*>(
         CModelInfo::GetModelInfo(veh->m_nModelIndex));
-    if (mi && mi->m_pVehicleStruct) {
-        out = mi->m_pVehicleStruct->m_avDummyPos[DUMMY_EXHAUST];
-        return true;
-    }
-    return false;
+    if (!mi || !mi->m_pVehicleStruct)
+        return false;
+
+    out = mi->m_pVehicleStruct->m_avDummyPos[6]; // DUMMY_EXHAUST from frame "exhaust"
+    return true;
 }
 
-static void KillNitroFlame(ExhaustState& st) {
-    if (st.fxNitro) { st.fxNitro->Kill(); st.fxNitro = nullptr; }
-    if (st.fxFlame) { st.fxFlame->Kill(); st.fxFlame = nullptr; }
+static void KillNitroFlame() {
+    if (g_fxNitro) { g_fxNitro->Kill(); g_fxNitro = nullptr; }
+    if (g_fxFlame) { g_fxFlame->Kill(); g_fxFlame = nullptr; }
 }
 
-static void KillRear(CVehicle* veh) {
-    auto it = g_exhaustStates.find(veh);
-    if (it == g_exhaustStates.end())
-        return;
-    KillNitroFlame(*it->second);
-    if (it->second->fxJT) {
-        it->second->fxJT->Kill();
-        it->second->fxJT = nullptr;
-    }
-    g_exhaustStates.erase(it);
-}
-
-static ExhaustState& GetExhaustState(CVehicle* veh) {
-    auto& ptr = g_exhaustStates[veh];
-    if (!ptr)
-        ptr = std::make_unique<ExhaustState>();
-    return *ptr;
+static void KillRear() {
+    KillNitroFlame();
+    if (g_fxJT) { g_fxJT->Kill(); g_fxJT = nullptr; }
+    g_bound = nullptr;
 }
 
 static void MakeLocalOriented(RwMatrix& mat, const RwV3d& off, float scale, float atY) {
     RwMatrixSetIdentity(&mat);
     mat.right = { scale, 0.0f, 0.0f };
-    mat.up    = { 0.0f, 0.0f, scale };
-    mat.at    = { 0.0f, atY * scale, 0.0f };
-    mat.pos   = off;
+    mat.up = { 0.0f, 0.0f, scale };
+    mat.at = { 0.0f, atY * scale, 0.0f };
+    mat.pos = off;
 }
 
 static void UpdatePitchedParent(RwMatrix& outParent, RwMatrix* vehMat,
-                                const RwV3d& exhaustOff, float pitchDeg) {
+    const RwV3d& exhaustOff, float pitchDeg) {
     const float r = pitchDeg * DEG2RAD;
     const float c = cosf(r);
     const float s = sinf(r);
@@ -266,12 +277,12 @@ static void UpdatePitchedParent(RwMatrix& outParent, RwMatrix* vehMat,
     const RwV3d A = vehMat->at;
 
     outParent.right = R;
-    outParent.up.x  = U.x * c + A.x * s;
-    outParent.up.y  = U.y * c + A.y * s;
-    outParent.up.z  = U.z * c + A.z * s;
-    outParent.at.x  = -U.x * s + A.x * c;
-    outParent.at.y  = -U.y * s + A.y * c;
-    outParent.at.z  = -U.z * s + A.z * c;
+    outParent.up.x = U.x * c + A.x * s;
+    outParent.up.y = U.y * c + A.y * s;
+    outParent.up.z = U.z * c + A.z * s;
+    outParent.at.x = -U.x * s + A.x * c;
+    outParent.at.y = -U.y * s + A.y * c;
+    outParent.at.z = -U.z * s + A.z * c;
 
     outParent.pos.x = R.x * exhaustOff.x + U.x * exhaustOff.y + A.x * exhaustOff.z + vehMat->pos.x;
     outParent.pos.y = R.y * exhaustOff.x + U.y * exhaustOff.y + A.y * exhaustOff.z + vehMat->pos.y;
@@ -279,7 +290,7 @@ static void UpdatePitchedParent(RwMatrix& outParent, RwMatrix* vehMat,
 }
 
 static FxSystem_c* CreateOnParent(const char* name, RwV3d* off, RwMatrix* parent,
-                                  float scale, float atY, float rate) {
+    float scale, float atY, float rate) {
     RwMatrix local;
     MakeLocalOriented(local, *off, scale, atY);
 
@@ -299,7 +310,7 @@ static FxSystem_c* CreateOnParent(const char* name, RwV3d* off, RwMatrix* parent
 }
 
 static FxSystem_c* CreatePitched(const char* name, RwV3d* exhaustOff, RwMatrix* vehMat,
-                                 RwMatrix& parentStore, float pitchDeg, float rate, float constTime) {
+    RwMatrix& parentStore, float pitchDeg, float rate, float constTime) {
     UpdatePitchedParent(parentStore, vehMat, *exhaustOff, pitchDeg);
 
     RwV3d zero = { 0.0f, 0.0f, 0.0f };
@@ -317,7 +328,7 @@ static FxSystem_c* CreatePitched(const char* name, RwV3d* exhaustOff, RwMatrix* 
 }
 
 static void UpdatePitched(FxSystem_c* fx, RwV3d* exhaustOff, RwMatrix* vehMat,
-                          RwMatrix& parentStore, float pitchDeg, float rate, float constTime) {
+    RwMatrix& parentStore, float pitchDeg, float rate, float constTime) {
     if (!fx || !vehMat)
         return;
 
@@ -335,15 +346,17 @@ static bool IsHoldingGas(CVehicle* veh) {
     CVehicle* playerVeh = FindPlayerVehicle(-1, false);
     if (!playerVeh || playerVeh != veh)
         return false;
+
     CPad* pad = CPad::GetPad(0);
     if (!pad)
         return false;
+
     return pad->GetAccelerate() > 0;
 }
 
 static constexpr float JET_MODE_TRIGGER_FRACTION = 0.5f;
 static constexpr float NOZZLE_HOVER_ANGLE = 5000.0f;
-static constexpr float NOZZLE_JET_ANGLE   = 0.0f;
+static constexpr float NOZZLE_JET_ANGLE = 0.0f;
 
 static bool IsInJetMode(CPlane* plane) {
     const float thresholdAngle = NOZZLE_HOVER_ANGLE
@@ -360,8 +373,11 @@ class HydraRearExhaustFx {
 public:
     HydraRearExhaustFx() {
         Events::vehicleRenderEvent += [](CVehicle* veh) {
-            if (!veh || veh->m_nModelIndex != MODEL_HYDRA)
+            if (!veh || veh->m_nModelIndex != MODEL_HYDRA) {
+                if (veh == g_bound)
+                    KillRear();
                 return;
+            }
 
             auto* plane = static_cast<CPlane*>(veh);
 
@@ -392,45 +408,50 @@ public:
                 return;
 
             const bool full = IsFullThrust(veh);
-            ExhaustState& st = GetExhaustState(veh);
 
-            const float jtRate  = full ? FULL_JT_RATE       : IDLE_JT_RATE;
-            const float jtPitch = full ? FULL_JT_PITCH_DEG  : IDLE_JT_PITCH_DEG;
+            if (g_bound != veh) {
+                KillRear();
+                g_bound = veh;
+            }
+
+            const float jtRate = full ? FULL_JT_RATE : IDLE_JT_RATE;
+            const float jtPitch = full ? FULL_JT_PITCH_DEG : IDLE_JT_PITCH_DEG;
             const float jtConst = full ? FULL_JT_CONST_TIME : IDLE_JT_CONST_TIME;
 
-            if (!st.fxJT)
-                st.fxJT = CreatePitched("jetthrust", &off, vehMat, st.jtParent,
-                                        jtPitch, jtRate, jtConst);
+            if (!g_fxJT)
+                g_fxJT = CreatePitched("jetthrust", &off, vehMat, g_jtParent,
+                    jtPitch, jtRate, jtConst);
             else
-                UpdatePitched(st.fxJT, &off, vehMat, st.jtParent,
-                              jtPitch, jtRate, jtConst);
+                UpdatePitched(g_fxJT, &off, vehMat, g_jtParent,
+                    jtPitch, jtRate, jtConst);
 
             if (full) {
-                if (!st.fxNitro)
-                    st.fxNitro = CreatePitched("nitro", &off, vehMat, st.nitroParent,
-                                               FULL_NITRO_PITCH_DEG, FULL_NITRO_RATE,
-                                               FULL_NITRO_CONST_TIME);
+                if (!g_fxNitro)
+                    g_fxNitro = CreatePitched("nitro", &off, vehMat, g_nitroParent,
+                        FULL_NITRO_PITCH_DEG, FULL_NITRO_RATE,
+                        FULL_NITRO_CONST_TIME);
                 else
-                    UpdatePitched(st.fxNitro, &off, vehMat, st.nitroParent,
-                                  FULL_NITRO_PITCH_DEG, FULL_NITRO_RATE,
-                                  FULL_NITRO_CONST_TIME);
+                    UpdatePitched(g_fxNitro, &off, vehMat, g_nitroParent,
+                        FULL_NITRO_PITCH_DEG, FULL_NITRO_RATE,
+                        FULL_NITRO_CONST_TIME);
 
-                if (!st.fxFlame)
-                    st.fxFlame = CreateOnParent("flame", &off, vehMat,
-                                                FULL_FLAME_SCALE, FULL_FLAME_AT_Y,
-                                                FULL_FLAME_RATE);
+                if (!g_fxFlame)
+                    g_fxFlame = CreateOnParent("flame", &off, vehMat,
+                        FULL_FLAME_SCALE, FULL_FLAME_AT_Y,
+                        FULL_FLAME_RATE);
                 else {
-                    st.fxFlame->SetOffsetPos(&off);
-                    st.fxFlame->SetRateMult(FULL_FLAME_RATE);
+                    g_fxFlame->SetOffsetPos(&off);
+                    g_fxFlame->SetRateMult(FULL_FLAME_RATE);
                 }
-            } else {
-                KillNitroFlame(st);
             }
-        };
+            else {
+                KillNitroFlame();
+            }
+            };
 
         Events::vehicleDtorEvent += [](CVehicle* veh) {
-            KillRear(veh);
-            g_aileronRests.erase(veh);
-        };
+            if (veh == g_bound)
+                KillRear();
+            };
     }
 } hydraRearExhaustFx;
