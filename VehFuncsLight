@@ -1,6 +1,6 @@
 /*
  * VehFuncs Light — f_class + f_extras + variable wheels + f_spoiler + _cl= + _pj= + f_hitch + f_gear/f_fan
- * + f_sld_ (slide doors) + f_ang_ (door open angle)
+ * + f_sld= (slide doors) + f_ang= (door open angle)
  * Logic taken from Junior_Djjr VehFuncs (RecursiveExtras / collapse / wheels / GearAndFan)
  * https://github.com/JuniorDjjr/VehFuncs
  */
@@ -1805,7 +1805,7 @@ static void __cdecl CustomAssignRemapTxd(const char* txdName, uint16_t txdId)
 
 
 // ============================================================
-// VehFuncs Extras — f_sld_ (slide doors) + f_ang_ (open angle)
+// VehFuncs Extras — f_sld= (slide doors) + f_ang= (open angle)
 // Separate from Junior core; heli ped entry via ProcessOpenDoor VMT
 // ============================================================
 
@@ -1882,7 +1882,7 @@ namespace AngleOverride
         if (!parentFrame) return false;
         char* parentName = GetFrameNodeName(parentFrame);
         if (!parentName) return false;
-        if (strncmp(parentName, "f_ang_", 6) != 0) return false;
+        if (strncmp(parentName, "f_ang=", 6) != 0) return false;
         char* end = nullptr;
         long degrees = strtol(parentName + 6, &end, 10);
         if (end == parentName + 6) return false;
@@ -1944,7 +1944,7 @@ namespace SlideDoor
 
     static bool TryGetSlideOverride(const char* parentName, CVector& outOffset)
     {
-        if (strncmp(parentName, "f_sld_", 6) != 0)
+        if (strncmp(parentName, "f_sld=", 6) != 0)
             return false;
         const char* cursor = parentName + 6;
         char* end = nullptr;
@@ -2359,7 +2359,7 @@ public:
                 d.flags.bPreservePaintjobColor = 0;
                 d.flags.bUpgradesUpdated = 1;
 
-                // f_sld_ / f_ang_
+                // f_sld= / f_ang=
                 AngleOverride::g_processedVehicles[vehicle] = false;
                 SlideDoor::g_slideData[vehicle] = SlideDoor::SlideData{};
                 VehFuncsExtrasShared::TrackIfHeli(vehicle);
@@ -2369,7 +2369,7 @@ public:
             {
                 if (!vehicle || !vehicle->m_pRwClump) return;
 
-                // f_ang_ + f_sld_ — automobiles only here (helis: processScripts + ProcessOpenDoor)
+                // f_ang= + f_sld= — automobiles only here (helis: processScripts + ProcessOpenDoor)
                 if (vehicle->m_nVehicleClass == VEHICLE_AUTOMOBILE)
                 {
                     AngleOverride::Update(static_cast<CAutomobile*>(vehicle));
@@ -2488,7 +2488,7 @@ public:
                 }
             };
 
-        // Helicopters: f_ang_ + f_sld_ (render event unreliable for helis)
+        // Helicopters: f_ang= + f_sld= (render event unreliable for helis)
         Events::processScriptsEvent += []
             {
                 for (CVehicle* vehicle : VehFuncsExtrasShared::g_activeHelis)
