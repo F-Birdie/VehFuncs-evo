@@ -23,7 +23,7 @@ namespace AngleOverride
         }
     }
 
-    // Parses "f_ang_<int>" (integer degrees, signed) off a frame's name.
+    // Parses "f_ang=<int>" (integer degrees, signed) off a frame's name.
     static bool TryGetAngleOverrideRadians(RwFrame* parentFrame, float& outRadians)
     {
         if (!parentFrame) return false;
@@ -31,7 +31,7 @@ namespace AngleOverride
         char* parentName = GetFrameNodeName(parentFrame);
         if (!parentName) return false;
 
-        const char* prefix = "f_ang_";
+        const char* prefix = "f_ang=";
         const size_t prefixLen = 6;
         if (strncmp(parentName, prefix, prefixLen) != 0) return false;
 
