@@ -36,7 +36,7 @@ namespace SlideDoor
 
     static bool TryGetSlideOverride(const char* parentName, CVector& outOffset)
     {
-        if (strncmp(parentName, "f_sld_", 6) != 0)
+        if (strncmp(parentName, "f_sld=", 6) != 0)
             return false;
 
         const char* cursor = parentName + 6;
