@@ -35,7 +35,7 @@ static RwFrame* FindFrameByName(RwFrame* root, const char* name) {
 }
 
 // =====================================================================
-// 1) Extra ailerons (aileron_l2 / aileron_r2)
+// 1) Extra ailerons (aileron_l2 / aileron_r2, hinge end from aileron2_pos)
 // =====================================================================
 
 struct RestMat {
@@ -43,7 +43,7 @@ struct RestMat {
     RwV3d right{}, up{}, at{}, pos{};
 };
 
-static RestMat restL, restR, restL2, restR2;
+static RestMat restL, restR, restL2, restR2, restP2;
 
 static void SaveRest(RwFrame* f, RestMat& out) {
     if (!f || out.valid)
@@ -58,8 +58,25 @@ static void SaveRest(RwFrame* f, RestMat& out) {
     out.valid = true;
 }
 
+static RwV3d RotateAroundAxis(const RwV3d& v, const RwV3d& a, float c, float s) {
+    const float dot = a.x * v.x + a.y * v.y + a.z * v.z;
+    const RwV3d cr = {
+        a.y * v.z - a.z * v.y,
+        a.z * v.x - a.x * v.z,
+        a.x * v.y - a.y * v.x
+    };
+    const float k = dot * (1.0f - c);
+    return {
+        v.x * c + cr.x * s + a.x * k,
+        v.y * c + cr.y * s + a.y * k,
+        v.z * c + cr.z * s + a.z * k
+    };
+}
+
+// hingeEnd = position of the far end of the hinge line (the aileron2_pos dummy,
+// mirrored for the left side). The frame origin is the near end.
 static void CopyOrientDelta(RwFrame* src, const RestMat& srcRest,
-    RwFrame* dst, const RestMat& dstRest) {
+    RwFrame* dst, const RestMat& dstRest, const RwV3d& hingeEnd) {
     if (!src || !dst || !srcRest.valid || !dstRest.valid)
         return;
     RwMatrix* sm = RwFrameGetMatrix(src);
@@ -67,33 +84,42 @@ static void CopyOrientDelta(RwFrame* src, const RestMat& srcRest,
     if (!sm || !dm)
         return;
 
-    const float r00 = srcRest.right.x, r01 = srcRest.up.x, r02 = srcRest.at.x;
-    const float r10 = srcRest.right.y, r11 = srcRest.up.y, r12 = srcRest.at.y;
-    const float r20 = srcRest.right.z, r21 = srcRest.up.z, r22 = srcRest.at.z;
+    // Stock aileron's current "up" vector expressed in its rest basis.
+    // The stock aileron rotates around its local X axis, so the angle is
+    // atan2(sin, cos) taken from the y/z components.
+    const RwV3d u = sm->up;
+    const float upY = srcRest.right.y * 0.0f; // (unused placeholder removed below)
+    (void)upY;
 
-    auto mulInvRest = [&](RwV3d v) -> RwV3d {
-        return {
-            r00 * v.x + r10 * v.y + r20 * v.z,
-            r01 * v.x + r11 * v.y + r21 * v.z,
-            r02 * v.x + r12 * v.y + r22 * v.z
-        };
-        };
+    const float dUpY = srcRest.up.x * u.x + srcRest.up.y * u.y + srcRest.up.z * u.z;
+    const float dUpZ = srcRest.at.x * u.x + srcRest.at.y * u.y + srcRest.at.z * u.z;
+    const float angle = atan2f(dUpZ, dUpY);
+    const float c = cosf(angle);
+    const float s = sinf(angle);
 
-    RwV3d dRight = mulInvRest(sm->right);
-    RwV3d dUp = mulInvRest(sm->up);
-    RwV3d dAt = mulInvRest(sm->at);
+    // Hinge axis: from the aileron origin to the dummy
+    RwV3d axis = {
+        hingeEnd.x - dstRest.pos.x,
+        hingeEnd.y - dstRest.pos.y,
+        hingeEnd.z - dstRest.pos.z
+    };
+    float len = sqrtf(axis.x * axis.x + axis.y * axis.y + axis.z * axis.z);
+    if (len < 1e-5f) {
+        axis = dstRest.right;
+        len = sqrtf(axis.x * axis.x + axis.y * axis.y + axis.z * axis.z);
+        if (len < 1e-5f)
+            return;
+    }
+    axis.x /= len; axis.y /= len; axis.z /= len;
 
-    auto mulDstRest = [&](RwV3d v) -> RwV3d {
-        return {
-            dstRest.right.x * v.x + dstRest.up.x * v.y + dstRest.at.x * v.z,
-            dstRest.right.y * v.x + dstRest.up.y * v.y + dstRest.at.y * v.z,
-            dstRest.right.z * v.x + dstRest.up.z * v.y + dstRest.at.z * v.z
-        };
-        };
+    // Keep the same rotation direction as the stock aileron's X axis
+    if (axis.x * srcRest.right.x + axis.y * srcRest.right.y + axis.z * srcRest.right.z < 0.0f) {
+        axis.x = -axis.x; axis.y = -axis.y; axis.z = -axis.z;
+    }
 
-    dm->right = mulDstRest(dRight);
-    dm->up = mulDstRest(dUp);
-    dm->at = mulDstRest(dAt);
+    dm->right = RotateAroundAxis(dstRest.right, axis, c, s);
+    dm->up = RotateAroundAxis(dstRest.up, axis, c, s);
+    dm->at = RotateAroundAxis(dstRest.at, axis, c, s);
     dm->pos = dstRest.pos;
 
     RwMatrixUpdate(dm);
@@ -118,16 +144,22 @@ public:
             RwFrame* root = RpClumpGetFrame(veh->m_pRwClump);
             RwFrame* l2 = FindFrameByName(root, "aileron_l2");
             RwFrame* r2 = FindFrameByName(root, "aileron_r2");
-            if (!l2 || !r2)
+            RwFrame* p2 = FindFrameByName(root, "aileron2_pos");
+            if (!l2 || !r2 || !p2)
                 return;
 
             SaveRest(al, restL);
             SaveRest(ar, restR);
             SaveRest(l2, restL2);
             SaveRest(r2, restR2);
+            SaveRest(p2, restP2);
 
-            CopyOrientDelta(al, restL, l2, restL2);
-            CopyOrientDelta(ar, restR, r2, restR2);
+            // aileron2_pos is always on the right (positive X); mirror it for the left
+            const RwV3d hingeR = restP2.pos;
+            const RwV3d hingeL = { -restP2.pos.x, restP2.pos.y, restP2.pos.z };
+
+            CopyOrientDelta(al, restL, l2, restL2, hingeL);
+            CopyOrientDelta(ar, restR, r2, restR2, hingeR);
             };
     }
 } aileronL2R2;
@@ -217,7 +249,7 @@ static constexpr float IDLE_JT_CONST_TIME = 0.5f;
 // ===================================================
 
 // ===================== FULL THRUST =================
-static constexpr float FULL_JT_RATE = 1.0f;
+static constexpr float FULL_JT_RATE = 5.0f;
 static constexpr float FULL_JT_PITCH_DEG = 0.0f;
 static constexpr float FULL_JT_CONST_TIME = 0.5f;
 
@@ -225,8 +257,8 @@ static constexpr float FULL_NITRO_RATE = 6.0f;
 static constexpr float FULL_NITRO_PITCH_DEG = 0.0f;
 static constexpr float FULL_NITRO_CONST_TIME = 0.5f;
 
-static constexpr float FULL_FLAME_SCALE = 2.0f;
-static constexpr float FULL_FLAME_RATE = 1.0f;
+static constexpr float FULL_FLAME_SCALE = 3.0f;
+static constexpr float FULL_FLAME_RATE = 10.0f;
 static constexpr float FULL_FLAME_AT_Y = -1.0f;
 // ===================================================
 
