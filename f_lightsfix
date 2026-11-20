@@ -1,0 +1,303 @@
+// Light dummies that follow moving parts (GTA SA 1.0 US, plugin-sdk). UNTESTED / NOT COMPILED.
+//
+// The problem: when a vehicle model loads, CVehicleModelInfo::PreprocessHierarchy reads the position of
+// the light dummies (headlights, taillights, headlights2, taillights2) ONCE, adds up the parents' matrices,
+// stores the result in the model info (m_avDummyPos) and destroys the frame. So a light parented to the
+// bonnet stays where the bonnet was when it was closed.
+//
+// The fix, in two parts:
+//   1. A hook on PreprocessHierarchy runs BEFORE the original. For every light dummy that sits somewhere
+//      below a moving part (kMovingParts), it records the name of that part and the dummy's position
+//      relative to it. Dummies that are not below one of those parts are not touched.
+//   2. The calls to CVehicle::DoVehicleLights are redirected. Right before the stock function runs, the
+//      model's dummy positions are replaced by the CURRENT positions (the part's present matrix and all
+//      its parents' matrices applied to the recorded position) and put back right after. The stock code
+//      draws the coronas, beams and reflections as it always does, just at the moved position.
+// No dff change is needed: keep the usual names, and parent the dummy to bonnet_dummy / boot_dummy / ...
+//
+// The stock code mirrors x for the left light, so this is right for parts that move symmetrically
+// (bonnet, boot). A door light would be mirrored wrongly.
+#include <cstdint>
+#include <cstring>
+#include <string>
+#include <unordered_map>
+
+#include "plugin.h"
+#include "CVehicle.h"
+#include "CAutomobile.h"
+#include "CModelInfo.h"
+#include "CVehicleModelInfo.h"
+#include "NodeName.h"
+#include "RenderWare.h"
+#include "common.h"
+
+using namespace plugin;
+
+constexpr unsigned PREPROCESS_HIERARCHY = 0x4C8E60; // CVehicleModelInfo::PreprocessHierarchy()
+constexpr unsigned DO_VEHICLE_LIGHTS = 0x6E1A60;    // CVehicle::DoVehicleLights(CMatrix&, flags)
+
+using PreprocessFn = void(__thiscall*)(CVehicleModelInfo*);
+using DoLightsFn = void(__thiscall*)(CVehicle*, CMatrix*, unsigned);
+static PreprocessFn origPreprocess = reinterpret_cast<PreprocessFn>(PREPROCESS_HIERARCHY);
+static DoLightsFn   origDoVehicleLights = reinterpret_cast<DoLightsFn>(DO_VEHICLE_LIGHTS);
+
+// ---- tune here
+// Dummy names in the dff, in the order of the model's dummy slots: 0 front main, 1 rear main,
+// 2 front secondary, 3 rear secondary.
+static const char* kLightNames[4] = { "headlights", "taillights", "headlights2", "taillights2" };
+
+// Frames that move. A light dummy below one of these follows it.
+static const char* kMovingParts[] = {
+    "bonnet_dummy", "boot_dummy",
+    "door_lf_dummy", "door_rf_dummy", "door_lr_dummy", "door_rr_dummy",
+};
+
+// A damaged moving part switches the lights it carries off, coronas AND lit lamp texture: during the stock
+// call the matching lights (front for headlights / headlights2, rear for taillights / taillights2) are
+// marked broken in the damage manager, which is exactly the state of a shot-out light, and put back
+// right after. Door statuses: 0 ok, 1 damaged, 2 opened (popped open, still intact), 3 opened and
+// damaged, 4 not present. Edit IsDamagedStatus to change what counts, for example only "4" for a part
+// that has come off.
+constexpr bool kStopLightsWhenPartDamaged = true;
+static bool IsDamagedStatus(unsigned status) { return status == 1 || status == 3 || status == 4; }
+
+// Door index (eDoors) of each moving part, -1 = unknown.
+static int DoorIndexOf(const char* name) {
+    if (_stricmp(name, "bonnet_dummy") == 0)  return 0;
+    if (_stricmp(name, "boot_dummy") == 0)    return 1;
+    if (_stricmp(name, "door_lf_dummy") == 0) return 2;
+    if (_stricmp(name, "door_rf_dummy") == 0) return 3;
+    if (_stricmp(name, "door_lr_dummy") == 0) return 4;
+    if (_stricmp(name, "door_rr_dummy") == 0) return 5;
+    return -1;
+}
+
+// ---------------------------------------------------------------- frame helpers
+struct FindCtx {
+    const char* name;
+    RwFrame* found;
+};
+
+static RwFrame* FindFrameCB(RwFrame* frame, void* data) {
+    auto* ctx = static_cast<FindCtx*>(data);
+    const char* n = GetFrameNodeName(frame);
+    if (n && _stricmp(n, ctx->name) == 0) {
+        ctx->found = frame;
+        return nullptr; // stop
+    }
+    RwFrameForAllChildren(frame, FindFrameCB, ctx);
+    return ctx->found ? nullptr : frame;
+}
+
+static RwFrame* FindFrame(RwFrame* root, const char* name) {
+    FindCtx ctx = { name, nullptr };
+    RwFrameForAllChildren(root, FindFrameCB, &ctx);
+    return ctx.found;
+}
+
+static bool IsMovingPart(const char* name) {
+    for (const char* part : kMovingParts) {
+        if (_stricmp(name, part) == 0)
+            return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------- links recorded at model load
+struct Link {
+    bool        valid = false;
+    std::string part;      // the moving part the dummy is below
+    RwV3d       local{};   // the dummy's position relative to that part
+    int         door = -1; // eDoors index of that part (for the damage check)
+};
+struct ModelLinks {
+    bool any = false;
+    Link slot[4];
+};
+static std::unordered_map<const void*, ModelLinks> g_links; // key: the model info
+
+static void CaptureLinks(CVehicleModelInfo* mi, RpClump* clump) {
+    ModelLinks links;
+    RwFrame* root = RpClumpGetFrame(clump);
+
+    for (int i = 0; i < 4; i++) {
+        RwFrame* dummy = FindFrame(root, kLightNames[i]);
+        if (!dummy)
+            continue;
+
+        // Walk up to the first moving part, adding up every frame in between (they move with the part).
+        RwV3d p = RwFrameGetMatrix(dummy)->pos;
+        for (RwFrame* f = RwFrameGetParent(dummy); f && f != root; f = RwFrameGetParent(f)) {
+            const char* n = GetFrameNodeName(f);
+            if (n && IsMovingPart(n)) {
+                links.slot[i].valid = true;
+                links.slot[i].part = n;
+                links.slot[i].local = p;
+                links.slot[i].door = DoorIndexOf(n);
+                links.any = true;
+                break;
+            }
+            RwV3dTransformPoints(&p, &p, 1, RwFrameGetMatrix(f));
+        }
+    }
+
+    if (links.any)
+        g_links[mi] = links;
+    else
+        g_links.erase(mi); // the model was reloaded without any linked dummy
+}
+
+// Runs before the original, while the dummy frames still exist.
+static void __fastcall PreprocessHook(CVehicleModelInfo* mi, void*) {
+    if (RpClump* clump = reinterpret_cast<RpClump*>(mi->m_pRwObject))
+        CaptureLinks(mi, clump);
+    origPreprocess(mi);
+}
+
+// ---------------------------------------------------------------- current positions
+struct VehicleFrames {
+    RpClump* clump = nullptr;
+    RwFrame* part[4] = {};
+};
+static std::unordered_map<CVehicle*, VehicleFrames> g_vehicles;
+
+// Current position of a linked dummy in the vehicle's own space: the part's present matrix and every parent's.
+static CVector CurrentPos(RpClump* clump, RwFrame* part, const RwV3d& local) {
+    RwFrame* root = RpClumpGetFrame(clump);
+    RwV3d p = local;
+    for (RwFrame* f = part; f && f != root; f = RwFrameGetParent(f))
+        RwV3dTransformPoints(&p, &p, 1, RwFrameGetMatrix(f));
+    return CVector(p.x, p.y, p.z);
+}
+
+// Only CAutomobile and CPlane objects have the damage manager this reads.
+static bool HasDamageManager(CVehicle* v) {
+    const unsigned vmt = *reinterpret_cast<unsigned*>(v);
+    return vmt == 0x871120 /* CAutomobile */ || vmt == 0x871948 /* CPlane */;
+}
+
+// ---------------------------------------------------------------- is the part showing its damaged model?
+struct PartState {
+    bool anyOk = false, anyDam = false;
+    bool okVisible = false, damVisible = false;
+};
+
+static RpAtomic* __cdecl PartAtomicCB(RpAtomic* atomic, void* data) {
+    auto* s = static_cast<PartState*>(data);
+    const uint8_t* b = reinterpret_cast<const uint8_t*>(atomic);
+    const int pluginOffset = *reinterpret_cast<const int*>(0x008D608C); // same read as Junior's IsDamAtomic
+    const unsigned compFlags = *reinterpret_cast<const uint16_t*>(b + pluginOffset + 2);
+    const bool visible = (atomic->object.object.flags & 0x4) != 0;     // rpATOMICRENDER
+
+    if (compFlags & 1) { s->anyOk = true;  s->okVisible |= visible; }
+    if (compFlags & 2) { s->anyDam = true; s->damVisible |= visible; }
+    return atomic;
+}
+
+// The part's own frame and everything below it (collapsed atomics sit on the dummy itself).
+static RwFrame* __cdecl PartFrameCB(RwFrame* frame, void* data) {
+    RwFrameForAllObjects(frame, reinterpret_cast<RwObjectCallBack>(PartAtomicCB), data);
+    RwFrameForAllChildren(frame, PartFrameCB, data);
+    return frame;
+}
+
+// true = the part shows its damaged model right now, or is gone.
+// fallbackStatus is only used when the part has no _ok/_dam atomics to look at.
+static bool PartIsBroken(RwFrame* part, unsigned fallbackStatus) {
+    PartState s;
+    PartFrameCB(part, &s);
+
+    if (!s.anyOk && !s.anyDam)
+        return IsDamagedStatus(fallbackStatus);
+
+    if (s.anyDam && s.damVisible)
+        return true;                       // damaged model is the one on screen
+    if (s.anyOk && !s.okVisible && !s.damVisible)
+        return true;                       // neither model shown: the part has come off
+    return false;
+}
+
+// Not static: other plugin files (planes, boats) can call this instead of DoVehicleLights.
+void __fastcall DoVehicleLightsHook(CVehicle* self, void*, CMatrix* matrix, unsigned flags) {
+    auto* mi = static_cast<CVehicleModelInfo*>(CModelInfo::GetModelInfo(self->m_nModelIndex));
+    const auto it = mi ? g_links.find(mi) : g_links.end();
+    if (it == g_links.end() || !mi->m_pVehicleStruct || !self->m_pRwClump) {
+        origDoVehicleLights(self, matrix, flags);
+        return;
+    }
+
+    const ModelLinks& links = it->second;
+    VehicleFrames& vf = g_vehicles[self];
+    if (vf.clump != self->m_pRwClump) { // first time for this instance
+        vf.clump = self->m_pRwClump;
+        for (int i = 0; i < 4; i++)
+            vf.part[i] = links.slot[i].valid ? FindFrame(RpClumpGetFrame(vf.clump), links.slot[i].part.c_str()) : nullptr;
+    }
+
+    CVector* dummies = mi->m_pVehicleStruct->m_avDummyPos;
+    const CVector saved[4] = { dummies[0], dummies[1], dummies[2], dummies[3] };
+    for (int i = 0; i < 4; i++) {
+        if (links.slot[i].valid && vf.part[i])
+            dummies[i] = CurrentPos(vf.clump, vf.part[i], links.slot[i].local);
+    }
+
+    // Is a part that carries one of the lights damaged? Then the lights of that end are switched off.
+    bool frontDead = false;
+    bool rearDead = false;
+    CDamageManager* dm = HasDamageManager(self) ? &static_cast<CAutomobile*>(self)->m_damageManager : nullptr;
+    if (kStopLightsWhenPartDamaged && dm) {
+        for (int i = 0; i < 4; i++) {
+            const Link& l = links.slot[i];
+            if (!l.valid || !vf.part[i])
+                continue;
+            const unsigned status = l.door >= 0 ? dm->GetDoorStatus(static_cast<eDoors>(l.door)) : 0;
+            if (PartIsBroken(vf.part[i], status)) {
+                if (i == 0 || i == 2)
+                    frontDead = true; // slots 0 and 2 are the front lights
+                else
+                    rearDead = true;  // slots 1 and 3 are the rear lights
+            }
+        }
+    }
+
+    // eLights: 0 front left, 1 front right, 2 rear right, 3 rear left. Status 1 = broken.
+    const bool kill[4] = { frontDead, frontDead, rearDead, rearDead };
+    unsigned savedLight[4] = {};
+    for (int l = 0; l < 4; l++) {
+        if (dm && kill[l]) {
+            savedLight[l] = dm->GetLightStatus(static_cast<eLights>(l));
+            dm->SetLightStatus(static_cast<eLights>(l), 1);
+        }
+    }
+
+    origDoVehicleLights(self, matrix, flags);
+
+    for (int l = 0; l < 4; l++) {
+        if (dm && kill[l])
+            dm->SetLightStatus(static_cast<eLights>(l), savedLight[l]);
+    }
+
+    for (int i = 0; i < 4; i++)
+        dummies[i] = saved[i];
+}
+
+// ---------------------------------------------------------------- hooks
+// Redirects every direct call to `target` in the exe's code to `hook`.
+static void RedirectCalls(unsigned target, void* hook) {
+    for (unsigned a = 0x401000; a < 0x857000 - 5; ++a) {
+        if (*reinterpret_cast<const uint8_t*>(a) != 0xE8)
+            continue;
+        const int32_t rel = *reinterpret_cast<const int32_t*>(a + 1);
+        if (a + 5 + rel == target)
+            patch::RedirectCall(a, hook);
+    }
+}
+
+class MovingLightDummies {
+public:
+    MovingLightDummies() {
+        RedirectCalls(PREPROCESS_HIERARCHY, reinterpret_cast<void*>(&PreprocessHook));
+        RedirectCalls(DO_VEHICLE_LIGHTS, reinterpret_cast<void*>(&DoVehicleLightsHook));
+        Events::vehicleDtorEvent += [](CVehicle* veh) { g_vehicles.erase(veh); };
+    }
+} g_movingLightDummies;
