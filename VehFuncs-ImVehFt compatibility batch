@@ -1,0 +1,435 @@
+// IVF_LightFix - main.cpp
+// Suppresses IVF coronas whose light dummy is no longer linked to the vehicle
+// (e.g. dummies of unselected VehFuncs f_extras branches).
+//
+// Pure parent check, NO position checks, NO radius tests:
+//  * A hardware execution breakpoint (DR0) on CCoronas::RegisterCorona fires for every call
+//    (nothing is patched; it does not matter how IVF calls the function).
+//  * For IVF's extras-light call site (ImVehFt.asi+0x71B8) the light dummy FRAME that IVF is
+//    working with is read from the caller's stack ([esp+0x160] at the breakpoint, cross-checked
+//    with [EBP+0x08]). Found with IVF_FrameFinder: it is the dummy frame of exactly that corona.
+//  * The dummy's parent chain is followed to the top. If the top is not the vehicle's clump
+//    root frame the dummy is orphaned -> the corona is dropped by returning from RegisterCorona
+//    ourselves (cdecl, void).
+//  * If the stored frame pointer no longer points to a valid frame at all (VehFuncs destroyed
+//    the dummy and the memory was reused) the dummy is gone too -> dropped.
+//
+// Requires only plugin-sdk (GTA SA 1.0 US). Offsets below belong to your current ImVehFt.asi build.
+// Hotkey in game: F9 = toggle the orphan check on/off (for comparing). That is the only key.
+
+#include <windows.h>
+#include <cstdio>
+#include <cstdarg>
+#include <cstdint>
+#include <cstring>
+#include <cctype>
+#include <string>
+#include <set>
+
+#include "plugin.h"
+#include "CVehicle.h"
+#include "NodeName.h"   // GetFrameNodeName (log only)
+
+#pragma comment(lib, "user32.lib") // GetAsyncKeyState
+
+using namespace plugin;
+
+// ------------------------------------------------------------------ config (tied to the current ImVehFt.asi build)
+static bool  gFilterEnabled = true;   // F9
+static const char* kIvfModule = "imvehft.asi";
+static const uintptr_t kExtrasCallSite = 0x71B8; // call site of IVF's extras lights inside ImVehFt.asi
+static const uintptr_t kFrameStackOffset = 0x160;  // [esp+0x160] at the breakpoint = the corona's dummy frame
+static const uintptr_t kFrameEbpOffset = 0x08;   // [EBP+0x08] holds the same frame (cross-check / fallback)
+static const char* kLogFile = "IVF_LightFix_log.txt";
+static const int       kMaxLogLines = 4000;
+
+// CCoronas::RegisterCorona, GTA SA 1.0 US
+static constexpr uintptr_t ADDR_RegisterCorona = 0x6FC180;
+
+// ------------------------------------------------------------------ state
+static FILE* gLog = nullptr;
+static int     gLogLines = 0;
+static unsigned gDropped = 0;
+static unsigned gHits = 0;
+static DWORD   gMainThreadId = 0;
+static std::set<uint64_t> gSeen;
+
+static void Log(const char* fmt, ...) {
+    if (!gLog) gLog = fopen(kLogFile, "w");
+    if (!gLog || gLogLines >= kMaxLogLines) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(gLog, fmt, ap);
+    va_end(ap);
+    fputc('\n', gLog);
+    fflush(gLog);
+    ++gLogLines;
+}
+
+static std::string Lower(std::string s) {
+    for (auto& c : s) c = (char)std::tolower((unsigned char)c);
+    return s;
+}
+
+static bool ModuleOf(uintptr_t addr, HMODULE& mod, std::string& name) {
+    mod = nullptr;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        (LPCSTR)addr, &mod) || !mod)
+        return false;
+    char path[MAX_PATH] = {};
+    GetModuleFileNameA(mod, path, MAX_PATH);
+    const char* slash = strrchr(path, '\\');
+    name = slash ? slash + 1 : path;
+    return true;
+}
+
+// ------------------------------------------------------------------ safe memory helpers (no C++ objects in __try functions)
+static bool Rd32(uintptr_t a, uint32_t* out) {
+    __try { *out = *(volatile uint32_t*)a; return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+static bool PlausiblePtr(uintptr_t p) {
+    // GTA SA can be 4 GB aware: heap pointers above 0x80000000 are normal. Reads are SEH-guarded.
+    return p >= 0x10000 && p < 0xFFFF0000 && (p & 3) == 0;
+}
+
+static bool Rd8(uintptr_t a, uint8_t* out) {
+    __try { *out = *(volatile uint8_t*)a; return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// LOG ONLY: dump 128 bytes of IVF's light entry (EDI) and any short ASCII strings its pointers lead to
+static void DumpEntry(uintptr_t base, char* out, int n) {
+    out[0] = 0;
+    int len = 0;
+    for (int i = 0; i < 32 && len < n - 80; ++i) {
+        uint32_t v = 0;
+        if (!Rd32(base + i * 4, &v)) break;
+        len += _snprintf(out + len, n - len, "%X:%08X", i * 4, v);
+        if (PlausiblePtr(v) || (v >= 0x10000 && v < 0x7FFE0000)) {
+            char s[20]; int k = 0;
+            for (; k < 16; ++k) {
+                uint8_t c = 0;
+                if (!Rd8(v + k, &c) || c == 0) break;
+                if (c < 32 || c > 126) { k = 0; break; }
+                s[k] = (char)c;
+            }
+            if (k >= 3) { s[k] = 0; len += _snprintf(out + len, n - len, "(\"%s\")", s); }
+        }
+        len += _snprintf(out + len, n - len, " ");
+    }
+    out[n - 1] = 0;
+}
+
+// LOG ONLY: does IVF's cached vector (entry+0x18..0x20) equal one of the frame's own matrix axes?
+static void AxisInfo(uintptr_t frame, uintptr_t entry, char* out, int n) {
+    out[0] = 0;
+    uint32_t e[3] = {};
+    if (!Rd32(entry + 0x18, &e[0]) || !Rd32(entry + 0x1C, &e[1]) || !Rd32(entry + 0x20, &e[2])) return;
+    float ev[3]; memcpy(ev, e, 12);
+    const char* names[3] = { "right", "up", "at" };
+    uintptr_t base = (uintptr_t) & ((RwFrame*)frame)->modelling;
+    int len = _snprintf(out, n, "cachedVec=(%.3f %.3f %.3f) matches=", ev[0], ev[1], ev[2]);
+    bool any = false;
+    for (int a = 0; a < 3; ++a) {
+        uint32_t w[3] = {};
+        if (!Rd32(base + a * 0x10, &w[0]) || !Rd32(base + a * 0x10 + 4, &w[1]) || !Rd32(base + a * 0x10 + 8, &w[2])) continue;
+        float fv[3]; memcpy(fv, w, 12);
+        bool m = true;
+        for (int i = 0; i < 3; ++i) { float d = fv[i] - ev[i]; if (d < 0) d = -d; if (d > 0.002f) m = false; }
+        if (m) { len += _snprintf(out + len, n - len, "%s ", names[a]); any = true; }
+    }
+    if (!any) _snprintf(out + len, n - len, "none");
+    out[n - 1] = 0;
+}
+
+// LOG ONLY: 4 dwords of the per-slot object pointed to by entry+0x74
+static void SlotObj(uintptr_t entry, char* out, int n) {
+    out[0] = 0;
+    uint32_t p = 0;
+    if (!Rd32(entry + 0x74, &p)) return;
+    uint32_t d[4] = {};
+    int len = _snprintf(out, n, "slotObj@%08X:", (unsigned)p);
+    for (int i = 0; i < 4; ++i) {
+        if (!Rd32(p + i * 4, &d[i])) break;
+        len += _snprintf(out + len, n - len, " %08X", d[i]);
+    }
+    out[n - 1] = 0;
+}
+
+// Looks like a RwFrame: its 'root' field points to a frame whose own 'root' is itself.
+static bool IsFrame(uintptr_t p) {
+    if (!PlausiblePtr(p)) return false;
+    RwFrame* f = (RwFrame*)p;
+    uint32_t root = 0, rootroot = 0, parent = 0;
+    if (!Rd32((uintptr_t)&f->root, &root)) return false;
+    if (!PlausiblePtr(root)) return false;
+    if (!Rd32((uintptr_t) & ((RwFrame*)root)->root, &rootroot)) return false;
+    if (rootroot != root) return false;
+    if (!Rd32((uintptr_t)&f->object.parent, &parent)) return false;
+    return true;
+}
+
+// Follows the parent chain to the top frame. 0 on failure.
+static uintptr_t TopFrame(uintptr_t p) {
+    for (int i = 0; i < 64; ++i) {
+        uint32_t par = 0;
+        if (!Rd32((uintptr_t) & ((RwFrame*)p)->object.parent, &par)) return 0;
+        if (par == 0) return p;
+        p = par;
+    }
+    return 0;
+}
+
+// Empty-frame check: a real light dummy has no child frames and no attached objects (atomics etc.).
+static RwObject* CountObjectCB(RwObject* o, void* data) {
+    ++*(int*)data;
+    return o;
+}
+
+static int FrameObjectCount(uintptr_t p) {   // -1 on failure
+    int n = 0;
+    __try { RwFrameForAllObjects((RwFrame*)p, CountObjectCB, &n); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+    return n;
+}
+
+// 1 = empty leaf, 0 = has children or objects (reused by another node), -1 = could not tell
+static int IsEmptyLeaf(uintptr_t p) {
+    uint32_t child = 0;
+    if (!Rd32((uintptr_t) & ((RwFrame*)p)->child, &child)) return -1;
+    if (child != 0) return 0;
+    int n = FrameObjectCount(p);
+    if (n < 0) return -1;
+    return n == 0 ? 1 : 0;
+}
+
+// LOG ONLY: frame's world position (ltm) minus vehicle position
+static bool LtmRel(uintptr_t f, const CVector& vp, float* o) {
+    RwFrame* fr = (RwFrame*)f;
+    uint32_t a = 0, b = 0, c = 0;
+    if (!Rd32((uintptr_t)&fr->ltm.pos.x, &a) || !Rd32((uintptr_t)&fr->ltm.pos.y, &b) ||
+        !Rd32((uintptr_t)&fr->ltm.pos.z, &c)) return false;
+    float x, y, z;
+    memcpy(&x, &a, 4); memcpy(&y, &b, 4); memcpy(&z, &c, 4);
+    o[0] = x - vp.x; o[1] = y - vp.y; o[2] = z - vp.z;
+    return true;
+}
+
+// Is 'p' actually in its parent's child list? (log only)
+static int InParentChildList(uintptr_t p) {
+    uint32_t par = 0;
+    if (!Rd32((uintptr_t) & ((RwFrame*)p)->object.parent, &par) || par == 0) return -1;
+    uint32_t c = 0;
+    if (!Rd32((uintptr_t) & ((RwFrame*)par)->child, &c)) return -1;
+    for (int i = 0; i < 512 && c; ++i) {
+        if (c == p) return 1;
+        uint32_t nx = 0;
+        if (!Rd32((uintptr_t) & ((RwFrame*)c)->next, &nx)) return -1;
+        c = nx;
+    }
+    return 0;
+}
+
+static void SafeName(uintptr_t p, char* buf, int n);
+
+// "name<-parent<-...<-top" (log only)
+static void PathStr(uintptr_t p, char* out, int n) {
+    out[0] = 0;
+    int len = 0;
+    for (int d = 0; d < 10 && p && len < n - 40; ++d) {
+        char nm[48];
+        SafeName(p, nm, sizeof(nm));
+        len += _snprintf(out + len, n - len, "%s%s", d ? "<-" : "", nm);
+        uint32_t par = 0;
+        if (!Rd32((uintptr_t) & ((RwFrame*)p)->object.parent, &par) || par == 0) break;
+        p = par;
+    }
+    out[n - 1] = 0;
+}
+
+static void SafeName(uintptr_t p, char* buf, int n) {
+    buf[0] = 0;
+    if (!p) return;
+    __try {
+        const char* s = GetFrameNodeName((RwFrame*)p);
+        if (s) {
+            int i = 0;
+            for (; i < n - 1 && s[i] >= 32 && s[i] < 127; ++i) buf[i] = s[i];
+            buf[i] = 0;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        buf[0] = '?'; buf[1] = 0;
+    }
+}
+
+// ------------------------------------------------------------------ breakpoint handler
+// Stack at function entry (cdecl):
+//  [esp+0x00] return address
+//  [esp+0x04] id   [esp+0x08] attachTo   [esp+0x0C..0x18] r,g,b,a   [esp+0x1C] const CVector* pos
+static LONG CALLBACK BreakpointHandler(PEXCEPTION_POINTERS ei) {
+    if (ei->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
+    if ((uintptr_t)ei->ExceptionRecord->ExceptionAddress != ADDR_RegisterCorona) return EXCEPTION_CONTINUE_SEARCH;
+    if (GetCurrentThreadId() != gMainThreadId) return EXCEPTION_CONTINUE_SEARCH;
+
+    PCONTEXT ctx = ei->ContextRecord;
+    const uint32_t* sp = (const uint32_t*)ctx->Esp;
+    ++gHits;
+
+    uintptr_t ret = sp[0];
+    uint32_t  id = sp[1];
+    CEntity* attach = (CEntity*)sp[2];
+
+    bool drop = false;
+
+    // LOG ONLY: every other IVF call site that registers a corona on a vehicle
+    // (now: every call from any plugin module, whatever it is attached to)
+    {
+        HMODULE m2 = nullptr; std::string n2;
+        if (ModuleOf(ret, m2, n2) && m2 != GetModuleHandleA(nullptr)) {
+            uint32_t aw = 0; int atype = -1;
+            if (attach && Rd32((uintptr_t)attach + 0x34, &aw)) atype = (int)((aw >> 16) & 7);
+            bool isExtras = (Lower(n2) == kIvfModule && (ret - (uintptr_t)m2) == kExtrasCallSite && atype == 2);
+            if (!isExtras) {
+                uintptr_t off = ret - (uintptr_t)m2;
+                uint64_t key = ((uint64_t)id << 1) ^ ((uint64_t)off << 40) ^ ((uint64_t)(uintptr_t)attach << 8) ^
+                    ((uint64_t)(uintptr_t)m2 << 20) ^ 0x5555;
+                if (gSeen.insert(key).second) {
+                    uint32_t pp = sp[7], px = 0, py = 0, pz = 0;
+                    Rd32(pp, &px); Rd32(pp + 4, &py); Rd32(pp + 8, &pz);
+                    float fx, fy, fz;
+                    memcpy(&fx, &px, 4); memcpy(&fy, &py, 4); memcpy(&fz, &pz, 4);
+                    Log("[OTHER] %s+0x%X id=0x%08X attach=%p type=%d pos=(%.3f %.3f %.3f) -> pass",
+                        n2.c_str(), (unsigned)off, id, (void*)attach, atype, fx, fy, fz);
+                }
+            }
+        }
+    }
+
+    if (gFilterEnabled && attach && attach->m_nType == ENTITY_TYPE_VEHICLE) {
+        HMODULE mod = nullptr; std::string modName;
+        if (ModuleOf(ret, mod, modName) && Lower(modName) == kIvfModule &&
+            (ret - (uintptr_t)mod) == kExtrasCallSite)
+        {
+            CVehicle* veh = static_cast<CVehicle*>(attach);
+            uintptr_t clumpRoot = 0;
+            if (veh->m_pRwClump) clumpRoot = (uintptr_t)((RwObject*)veh->m_pRwClump)->parent;
+
+            // the corona's dummy frame
+            uint32_t frame = 0;
+            Rd32(ctx->Esp + kFrameStackOffset, &frame);
+            if (!IsFrame(frame)) {
+                uint32_t alt = 0;
+                if (Rd32(ctx->Ebp + kFrameEbpOffset, &alt) && IsFrame(alt)) frame = alt;
+            }
+
+            const char* reason = "";
+            uintptr_t top = 0;
+            if (frame == 0 || !PlausiblePtr(frame)) {
+                // no frame stored at all: nothing to judge, leave the corona alone
+            }
+            else if (!IsFrame(frame)) {
+                drop = true; reason = "dummy frame no longer exists (stale pointer)";
+            }
+            else {
+                top = TopFrame(frame);
+                if (clumpRoot && top != clumpRoot) { drop = true; reason = "dummy not linked to the vehicle"; }
+                else if (IsEmptyLeaf(frame) == 0) { drop = true; reason = "frame is not an empty light dummy (pointer reused by another node)"; }
+            }
+
+            uint64_t key = ((uint64_t)id << 1) ^ (drop ? 1 : 0) ^ ((uint64_t)(uintptr_t)veh << 32);
+            if (gSeen.insert(key).second) {
+                char name[64], topName[64], path[400];
+                SafeName(frame, name, sizeof(name));
+                SafeName(top, topName, sizeof(topName));
+                path[0] = 0;
+                int inList = -1;
+                char ent[900];
+                DumpEntry(ctx->Edi, ent, sizeof(ent));
+                float rel[3] = { 0, 0, 0 };
+                if (IsFrame(frame)) {
+                    PathStr(frame, path, sizeof(path)); inList = InParentChildList(frame);
+                    CVector vp = veh->GetPosition();
+                    LtmRel(frame, vp, rel);
+                }
+                Log("[IVF] +0x%X id=0x%08X veh=%p model=%d frame=%p(%s) top=%p(%s) inParentList=%d relWorld=(%.2f %.2f %.2f) path=%s -> %s%s%s",
+                    (unsigned)kExtrasCallSite, id, (void*)veh, (int)veh->m_nModelIndex,
+                    (void*)(uintptr_t)frame, name, (void*)top, topName, inList, rel[0], rel[1], rel[2], path,
+                    drop ? "DROP" : "pass", drop ? " : " : "", drop ? reason : "");
+                char ax[160] = "", so[160] = "";
+                if (IsFrame(frame)) AxisInfo(frame, ctx->Edi, ax, sizeof(ax));
+                SlotObj(ctx->Edi, so, sizeof(so));
+                Log("      slot=%u %s | %s", (unsigned)(id & 0xFF), ax, so);
+            }
+        }
+    }
+
+    if (drop) {
+        ++gDropped;
+        ctx->Eip = (DWORD)ret;   // behave like the function returned immediately
+        ctx->Esp += 4;           // cdecl: caller cleans the arguments
+    }
+    else {
+        ctx->EFlags |= 0x10000;  // resume flag: run the instruction without re-triggering
+    }
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+// ------------------------------------------------------------------ install breakpoint on main thread
+struct InstallArgs { DWORD tid; bool ok; };
+
+static DWORD WINAPI InstallThread(LPVOID p) {
+    auto* args = (InstallArgs*)p;
+    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, args->tid);
+    if (!h) return 0;
+    if (SuspendThread(h) != (DWORD)-1) {
+        CONTEXT c = {};
+        c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        if (GetThreadContext(h, &c)) {
+            c.Dr0 = (DWORD)ADDR_RegisterCorona;
+            c.Dr7 &= ~0x000F0003u;  // clear L0/G0 and RW0/LEN0 (execute, length 1)
+            c.Dr7 |= 0x1;           // enable local breakpoint 0
+            c.Dr6 = 0;
+            args->ok = SetThreadContext(h, &c) != FALSE;
+        }
+        ResumeThread(h);
+    }
+    CloseHandle(h);
+    return 0;
+}
+
+static void InstallBreakpoint() {
+    gMainThreadId = GetCurrentThreadId();
+    AddVectoredExceptionHandler(1, BreakpointHandler);
+
+    InstallArgs args = { gMainThreadId, false };
+    HANDLE t = CreateThread(nullptr, 0, InstallThread, &args, 0, nullptr);
+    if (t) { WaitForSingleObject(t, 5000); CloseHandle(t); }
+    Log("hardware breakpoint on 0x%X %s", (unsigned)ADDR_RegisterCorona, args.ok ? "installed" : "FAILED");
+}
+
+// ------------------------------------------------------------------ plugin
+class IVFLightFix {
+public:
+    IVFLightFix() {
+        Events::initGameEvent += [] { InstallBreakpoint(); };
+
+        Events::processScriptsEvent += [] {
+            static bool f9 = false;
+            bool d9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+            if (d9 && !f9) {
+                gFilterEnabled = !gFilterEnabled;
+                Log("filter %s (RegisterCorona hits: %u, dropped: %u)",
+                    gFilterEnabled ? "ON" : "OFF", gHits, gDropped);
+            }
+            f9 = d9;
+            };
+
+        Events::shutdownRwEvent += [] {
+            if (gLog) { fclose(gLog); gLog = nullptr; }
+            };
+    }
+} gIVFLightFix;
