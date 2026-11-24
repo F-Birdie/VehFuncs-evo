@@ -1,4 +1,4 @@
-// IVF_LightFix - main.cpp  (hardened version, module name + logging + F9 removed)
+// IVF_LightFix - main.cpp
 //
 // Problem: VehFuncs frees the frames of unselected extras, but IVF keeps raw pointers to its own
 // light dummy frames and keeps registering coronas for them.
@@ -16,6 +16,9 @@
 //      2. the frame is not reachable from the vehicle's root frame, or
 //      3. the frame is not an empty light dummy.
 //  * The handler uses no heap and no file I/O.
+//  * Position fix: for a light nested under VehFuncs extras on a car node (bump_front_dummy,
+//    boot_dummy, ...), IVF's position is wrong. The corona position argument is replaced by the
+//    light's real vehicle-space position, computed from the frame hierarchy (modelling matrices).
 
 #include <windows.h>
 #include <cstdint>
@@ -23,6 +26,7 @@
 
 #include "plugin.h"
 #include "CVehicle.h"
+#include "NodeName.h"   // GetFrameNodeName
 
 using namespace plugin;
 
@@ -98,6 +102,51 @@ static int Evaluate(uint32_t frame, uintptr_t clumpRoot) {
     return 0;                               // pass
 }
 
+
+// ------------------------------------------------------------------ position fix
+static CVector gCorrectedPos;   // handler runs on the main thread only
+
+static bool IsCarNodeName(const char* name) {
+    if (!name) return false;
+    return strstr(name, "bonnet_dummy") || strstr(name, "boot_dummy") ||
+        strstr(name, "door_lf_dummy") || strstr(name, "door_rf_dummy") ||
+        strstr(name, "door_lr_dummy") || strstr(name, "door_rr_dummy") ||
+        strstr(name, "wing_lf_dummy") || strstr(name, "wing_rf_dummy") ||
+        strstr(name, "bump_front_dummy") || strstr(name, "bump_rear_dummy");
+}
+
+// True when a car node sits above the light's direct parent (i.e. the light is nested under extras).
+static bool NestedUnderCarNode(RwFrame* frame, RwFrame* root) {
+    __try {
+        RwFrame* parent = (RwFrame*)frame->object.parent;
+        if (!parent || parent == root) return false;
+        RwFrame* p = (RwFrame*)parent->object.parent;
+        for (int i = 0; i < 64 && p && p != root; ++i, p = (RwFrame*)p->object.parent)
+            if (IsCarNodeName(GetFrameNodeName(p))) return true;
+        return false;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// Light position in the vehicle's space: apply each ancestor's modelling matrix up to (not including) the root.
+static bool VehicleSpacePos(RwFrame* frame, RwFrame* root, CVector* out) {
+    __try {
+        float x = frame->modelling.pos.x, y = frame->modelling.pos.y, z = frame->modelling.pos.z;
+        RwFrame* a = (RwFrame*)frame->object.parent;
+        for (int i = 0; i < 64 && a && a != root; ++i, a = (RwFrame*)a->object.parent) {
+            const RwMatrix& m = a->modelling;
+            float nx = m.right.x * x + m.up.x * y + m.at.x * z + m.pos.x;
+            float ny = m.right.y * x + m.up.y * y + m.at.y * z + m.pos.y;
+            float nz = m.right.z * x + m.up.z * y + m.at.z * z + m.pos.z;
+            x = nx; y = ny; z = nz;
+        }
+        if (a != root) return false;
+        out->x = x; out->y = y; out->z = z;
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
 // ------------------------------------------------------------------ breakpoint handler
 static LONG CALLBACK BreakpointHandler(PEXCEPTION_POINTERS ei) {
     if (ei->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
@@ -138,7 +187,13 @@ static LONG CALLBACK BreakpointHandler(PEXCEPTION_POINTERS ei) {
 
                 if (frame != 0 && root != 0) {
                     int reason = Evaluate(frame, root);
-                    if (reason != 0) drop = true;
+                    if (reason != 0) {
+                        drop = true;
+                    }
+                    else if (NestedUnderCarNode((RwFrame*)(uintptr_t)frame, (RwFrame*)(uintptr_t)root) &&
+                        VehicleSpacePos((RwFrame*)(uintptr_t)frame, (RwFrame*)(uintptr_t)root, &gCorrectedPos)) {
+                        ((uint32_t*)ctx->Esp)[7] = (uint32_t)(uintptr_t)&gCorrectedPos;  // arg 6: const CVector* pos
+                    }
                 }
             }
         }
