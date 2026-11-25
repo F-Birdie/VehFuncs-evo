@@ -1,0 +1,90 @@
+// TrailerLights
+// IVF only processes lights on a "driven" vehicle.
+// Copy only the minimum state (driver + class) so IVF runs on the trailer,
+// then mirror the tractor's actual light flags onto the trailer.
+// Light controls (foglights etc.) stay on the tractor.
+
+#include <vector>
+
+#include "plugin.h"
+#include "CPools.h"
+#include "CVehicle.h"
+
+using namespace plugin;
+
+struct SavedState {
+    CVehicle* veh = nullptr;
+    CPed*     driver = nullptr;
+    eVehicleType vehClass = VEHICLE_AUTOMOBILE;
+    eVehicleType vehSubClass = VEHICLE_AUTOMOBILE;
+    bool      lightsOn = false;
+    unsigned char overrideLights = 0;
+};
+
+static std::vector<SavedState> gSaved;
+
+static void RestoreRealState() {
+    auto* pool = CPools::ms_pVehiclePool;
+    if (!pool) return;
+
+    for (int i = 0; i < (int)gSaved.size() && i < pool->m_nSize; ++i) {
+        SavedState& s = gSaved[i];
+        if (!s.veh) continue;
+
+        if (pool->GetAt(i) == s.veh) {
+            s.veh->m_pDriver          = s.driver;
+            s.veh->m_nVehicleClass    = s.vehClass;
+            s.veh->m_nVehicleSubClass = s.vehSubClass;
+            s.veh->bLightsOn          = s.lightsOn;
+            s.veh->m_nOverrideLights  = s.overrideLights;
+        }
+        s.veh = nullptr;
+    }
+}
+
+static void ApplyDrivenState() {
+    auto* pool = CPools::ms_pVehiclePool;
+    if (!pool) return;
+
+    const int n = pool->m_nSize;
+    if ((int)gSaved.size() < n)
+        gSaved.resize(n);
+
+    for (int i = 0; i < n; ++i) {
+        CVehicle* v = pool->GetAt(i);
+        if (!v || !v->m_pTractor)
+            continue;
+
+        CVehicle* root = v->m_pTractor;
+        for (int d = 0; d < 8 && root->m_pTractor; ++d)
+            root = root->m_pTractor;
+
+        if (!root->m_pDriver)
+            continue;
+
+        SavedState& s = gSaved[i];
+        s.veh            = v;
+        s.driver         = v->m_pDriver;
+        s.vehClass       = v->m_nVehicleClass;
+        s.vehSubClass    = v->m_nVehicleSubClass;
+        s.lightsOn       = v->bLightsOn;
+        s.overrideLights = v->m_nOverrideLights;
+
+        // Minimum to make IVF treat the trailer as driven
+        v->m_pDriver          = root->m_pDriver;
+        v->m_nVehicleClass    = root->m_nVehicleClass;
+        v->m_nVehicleSubClass = root->m_nVehicleSubClass;
+
+        // Mirror the tractor's light state (after player input has already been applied to the tractor)
+        v->bLightsOn         = root->bLightsOn;
+        v->m_nOverrideLights = root->m_nOverrideLights;
+    }
+}
+
+class TrailerLights {
+public:
+    TrailerLights() {
+        Events::gameProcessEvent       += RestoreRealState;
+        Events::gameProcessEvent.after += ApplyDrivenState;
+    }
+} gTrailerLights;
