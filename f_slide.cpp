@@ -1,6 +1,7 @@
 #include "plugin.h"
 #include "CAutomobile.h"
 #include "CHeli.h"
+#include "CPools.h"
 #include "NodeName.h"
 #include <Windows.h>
 #include <unordered_map>
@@ -127,7 +128,7 @@ namespace SlideDoor
     };
 
     static std::unordered_map<CVehicle*, SlideData> g_slideData;
-    static std::vector<CVehicle*> g_activeHelis;
+    // (g_activeHelis removed: the script loop now walks the vehicle pool instead)
 
     static bool IsHelicopter(CVehicle* vehicle)
     {
@@ -274,28 +275,34 @@ namespace SlideDoor
     void OnVehicleModelChanged(CVehicle* vehicle)
     {
         g_slideData[vehicle] = SlideData{};
-        if (IsHelicopter(vehicle))
-        {
-            if (std::find(g_activeHelis.begin(), g_activeHelis.end(), vehicle) == g_activeHelis.end())
-                g_activeHelis.push_back(vehicle);
-        }
     }
 
     void OnVehicleDestroyed(CVehicle* vehicle)
     {
         g_slideData.erase(vehicle);
-        auto it = std::find(g_activeHelis.begin(), g_activeHelis.end(), vehicle);
-        if (it != g_activeHelis.end())
-            g_activeHelis.erase(it);
+    }
+
+    // Replaces the old g_activeHelis list: walk the pool, so no stored pointers can go stale.
+    void UpdateAllHelis()
+    {
+        auto* pool = CPools::ms_pVehiclePool;
+        if (!pool)
+            return;
+
+        for (int i = 0; i < pool->m_nSize; ++i)
+        {
+            CVehicle* v = pool->GetAt(i); // null for free slots
+            if (!v || !v->m_pRwClump)
+                continue;
+            if (!IsHelicopter(v))
+                continue;
+            Update(static_cast<CAutomobile*>(v));
+        }
     }
 
     // ----------------------------------------------------------------
-    // Ped entry path: CVehicle::ProcessOpenDoor is virtual slot 28,
-    // confirmed directly from plugin-sdk's CVehicle.cpp itself:
-    //   (*(void***)this)[28] is exactly how the SDK calls it.
-    // We patch that slot in the vtable rather than scanning for a
-    // hardcoded function address - the slot index is a more stable
-    // target than one build's raw memory offset for the function body.
+    // Ped entry path: unchanged from the original. ONE saved original is
+    // shared by both vtables on purpose; the original worked this way.
     // ----------------------------------------------------------------
 
     using ProcessOpenDoor_t = void(__thiscall*)(CVehicle*, CPed*, uint32_t, uint32_t, uint32_t, float);
@@ -334,11 +341,8 @@ namespace SlideDoor
 
     static void InstallProcessOpenDoorHooks()
     {
-        // US 1.0 HOODLUM - class vtable bases (build-specific)
         PatchProcessOpenDoorSlot(reinterpret_cast<uintptr_t*>(0x871120)); // CAutomobile
         PatchProcessOpenDoorSlot(reinterpret_cast<uintptr_t*>(0x871680)); // CHeli
-        // If Real_ProcessOpenDoor is still null, vtable base differs -
-        // hooks simply do nothing (no crash)
     }
 }
 
@@ -367,11 +371,7 @@ public:
 
         Events::processScriptsEvent += []
             {
-                for (CVehicle* vehicle : SlideDoor::g_activeHelis)
-                {
-                    if (vehicle)
-                        SlideDoor::Update(static_cast<CAutomobile*>(vehicle));
-                }
+                SlideDoor::UpdateAllHelis();
             };
 
         Events::vehicleDtorEvent.before += [](CVehicle* vehicle)
