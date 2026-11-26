@@ -1,8 +1,6 @@
 #include "plugin.h"
 #include "CAutomobile.h"
 #include "CHeli.h"
-#include "CPools.h"
-#include "CTimer.h"
 #include "NodeName.h"
 #include <Windows.h>
 #include <unordered_map>
@@ -126,11 +124,10 @@ namespace SlideDoor
         CVector closedPosition[6] = {};
         AxisSlices slices[6] = {};
         bool scanned = false;
-        unsigned int lastFrame = 0xFFFFFFFF; // last frame a non-forced Update ran
     };
 
-    // Entries are created ONLY in OnVehicleModelChanged.
     static std::unordered_map<CVehicle*, SlideData> g_slideData;
+    static std::vector<CVehicle*> g_activeHelis;
 
     static bool IsHelicopter(CVehicle* vehicle)
     {
@@ -172,14 +169,16 @@ namespace SlideDoor
         }
     }
 
-    static void ApplySlideForDoor(CAutomobile* automobile, SlideData& data, int doorIndex)
+    static void ApplySlideForDoor(CAutomobile* automobile, int doorIndex)
     {
         if (!automobile || doorIndex < 0 || doorIndex > 5)
             return;
 
-        if (!data.scanned || !data.hasOverride[doorIndex])
+        auto it = g_slideData.find(static_cast<CVehicle*>(automobile));
+        if (it == g_slideData.end() || !it->second.scanned || !it->second.hasOverride[doorIndex])
             return;
 
+        SlideData& data = it->second;
         eCarNodes node = DoorIndexToNode(doorIndex);
         if (node == CAR_NODE_NONE)
             return;
@@ -252,120 +251,71 @@ namespace SlideDoor
         data.scanned = true;
     }
 
-    static void ApplySlideOverrides(CAutomobile* automobile, SlideData& data)
+    static void ApplySlideOverrides(CAutomobile* automobile, SlideData& data, bool isHeli)
     {
+        (void)isHeli;
         for (int i = 0; i < 6; ++i)
         {
             if (data.hasOverride[i])
-                ApplySlideForDoor(automobile, data, i);
+                ApplySlideForDoor(automobile, i);
         }
     }
 
-    // force == true: always run (used by the render event, the last update before drawing).
-    // force == false: at most once per game frame (script loop, door hook).
-    void Update(CAutomobile* automobile, bool force)
+    void Update(CAutomobile* automobile)
     {
-        if (!automobile)
-            return;
-
         CVehicle* vehicle = static_cast<CVehicle*>(automobile);
-        if (!vehicle->m_pRwClump)
-            return;
-
-        // find, never operator[]: Update must not create entries.
-        auto it = g_slideData.find(vehicle);
-        if (it == g_slideData.end())
-            return;
-
-        SlideData& data = it->second;
-
-        if (!force)
-        {
-            if (data.lastFrame == CTimer::m_FrameCounter)
-                return;
-            data.lastFrame = CTimer::m_FrameCounter;
-        }
-
         bool isHeli = IsHelicopter(vehicle);
+        SlideData& data = g_slideData[vehicle];
         ScanVehicle(automobile, data, isHeli);
         if (data.scanned)
-            ApplySlideOverrides(automobile, data);
+            ApplySlideOverrides(automobile, data, isHeli);
     }
 
     void OnVehicleModelChanged(CVehicle* vehicle)
     {
-        // The only place entries are created (or reset).
         g_slideData[vehicle] = SlideData{};
+        if (IsHelicopter(vehicle))
+        {
+            if (std::find(g_activeHelis.begin(), g_activeHelis.end(), vehicle) == g_activeHelis.end())
+                g_activeHelis.push_back(vehicle);
+        }
     }
 
     void OnVehicleDestroyed(CVehicle* vehicle)
     {
         g_slideData.erase(vehicle);
-    }
-
-    void OnGameInit()
-    {
-        g_slideData.clear();
-    }
-
-    // Walk the vehicle pool instead of keeping stored pointers.
-    void UpdateAllHelis()
-    {
-        auto* pool = CPools::ms_pVehiclePool;
-        if (!pool)
-            return;
-
-        for (int i = 0; i < pool->m_nSize; ++i)
-        {
-            CVehicle* v = pool->GetAt(i); // null for free slots
-            if (!v || !v->m_pRwClump)
-                continue;
-            if (!IsHelicopter(v))
-                continue;
-            Update(static_cast<CAutomobile*>(v), false);
-        }
+        auto it = std::find(g_activeHelis.begin(), g_activeHelis.end(), vehicle);
+        if (it != g_activeHelis.end())
+            g_activeHelis.erase(it);
     }
 
     // ----------------------------------------------------------------
-    // Ped entry path: CVehicle::ProcessOpenDoor is virtual slot 28.
-    // We patch that slot in the vtable. CAutomobile and CHeli each get
-    // their own saved original, since their slots may differ.
-    // The hook returns bool and passes through the original's result;
-    // if the real function is void, the caller ignores it anyway.
+    // Ped entry path: CVehicle::ProcessOpenDoor is virtual slot 28,
+    // confirmed directly from plugin-sdk's CVehicle.cpp itself:
+    //   (*(void***)this)[28] is exactly how the SDK calls it.
+    // We patch that slot in the vtable rather than scanning for a
+    // hardcoded function address - the slot index is a more stable
+    // target than one build's raw memory offset for the function body.
     // ----------------------------------------------------------------
 
-    using ProcessOpenDoor_t = bool(__thiscall*)(CVehicle*, CPed*, uint32_t, uint32_t, uint32_t, float);
-    static ProcessOpenDoor_t Real_ProcessOpenDoor_Auto = nullptr;
-    static ProcessOpenDoor_t Real_ProcessOpenDoor_Heli = nullptr;
+    using ProcessOpenDoor_t = void(__thiscall*)(CVehicle*, CPed*, uint32_t, uint32_t, uint32_t, float);
+    static ProcessOpenDoor_t Real_ProcessOpenDoor = nullptr;
 
-    static void AfterOpenDoor(CVehicle* self)
+    static void __fastcall ProcessOpenDoor_Hook(CVehicle* self, void*, CPed* ped,
+        uint32_t doorComponentId, uint32_t arg2, uint32_t arg3, float arg4)
     {
-        if (!self || !self->m_pRwClump)
+        Real_ProcessOpenDoor(self, ped, doorComponentId, arg2, arg3, arg4);
+
+        if (!self)
             return;
         if (self->m_nVehicleClass != VEHICLE_AUTOMOBILE &&
             self->m_nVehicleClass != VEHICLE_HELI)
             return;
 
-        Update(static_cast<CAutomobile*>(self), false);
+        Update(static_cast<CAutomobile*>(self));
     }
 
-    static bool __fastcall ProcessOpenDoor_Hook_Auto(CVehicle* self, void*, CPed* ped,
-        uint32_t doorComponentId, uint32_t arg2, uint32_t arg3, float arg4)
-    {
-        bool result = Real_ProcessOpenDoor_Auto(self, ped, doorComponentId, arg2, arg3, arg4);
-        AfterOpenDoor(self);
-        return result;
-    }
-
-    static bool __fastcall ProcessOpenDoor_Hook_Heli(CVehicle* self, void*, CPed* ped,
-        uint32_t doorComponentId, uint32_t arg2, uint32_t arg3, float arg4)
-    {
-        bool result = Real_ProcessOpenDoor_Heli(self, ped, doorComponentId, arg2, arg3, arg4);
-        AfterOpenDoor(self);
-        return result;
-    }
-
-    static void PatchProcessOpenDoorSlot(uintptr_t* vmt, ProcessOpenDoor_t& realOut, void* hook)
+    static void PatchProcessOpenDoorSlot(uintptr_t* vmt)
     {
         if (!vmt) return;
 
@@ -374,30 +324,21 @@ namespace SlideDoor
         if (!VirtualProtect(&vmt[slot], sizeof(uintptr_t), PAGE_READWRITE, &oldProt))
             return;
 
-        if (!realOut)
-            realOut = reinterpret_cast<ProcessOpenDoor_t>(vmt[slot]);
+        if (!Real_ProcessOpenDoor)
+            Real_ProcessOpenDoor = reinterpret_cast<ProcessOpenDoor_t>(vmt[slot]);
 
-        vmt[slot] = reinterpret_cast<uintptr_t>(hook);
-        // hook is passed as void* because the __fastcall hooks don't match ProcessOpenDoor_t's type
+        vmt[slot] = reinterpret_cast<uintptr_t>(&ProcessOpenDoor_Hook);
 
         VirtualProtect(&vmt[slot], sizeof(uintptr_t), oldProt, &oldProt);
     }
 
-    static bool g_hooksInstalled = false;
-
     static void InstallProcessOpenDoorHooks()
     {
-        // initRwEvent can fire more than once; never patch twice
-        // (a second patch would save our own hook as the "original" and recurse).
-        if (g_hooksInstalled)
-            return;
-        g_hooksInstalled = true;
-
-        // US 1.0 HOODLUM - class vtable bases
-        PatchProcessOpenDoorSlot(reinterpret_cast<uintptr_t*>(0x871120), Real_ProcessOpenDoor_Auto,
-            reinterpret_cast<void*>(&ProcessOpenDoor_Hook_Auto)); // CAutomobile
-        PatchProcessOpenDoorSlot(reinterpret_cast<uintptr_t*>(0x871680), Real_ProcessOpenDoor_Heli,
-            reinterpret_cast<void*>(&ProcessOpenDoor_Hook_Heli)); // CHeli
+        // US 1.0 HOODLUM - class vtable bases (build-specific)
+        PatchProcessOpenDoorSlot(reinterpret_cast<uintptr_t*>(0x871120)); // CAutomobile
+        PatchProcessOpenDoorSlot(reinterpret_cast<uintptr_t*>(0x871680)); // CHeli
+        // If Real_ProcessOpenDoor is still null, vtable base differs -
+        // hooks simply do nothing (no crash)
     }
 }
 
@@ -411,12 +352,6 @@ public:
                 SlideDoor::InstallProcessOpenDoorHooks();
             };
 
-        // Wipe all state whenever scripts (re)initialize: new game / save load.
-        Events::initScriptsEvent += []
-            {
-                SlideDoor::OnGameInit();
-            };
-
         Events::vehicleSetModelEvent += [](CVehicle* vehicle, int)
             {
                 SlideDoor::OnVehicleModelChanged(vehicle);
@@ -424,17 +359,19 @@ public:
 
         Events::vehicleRenderEvent.before += [](CVehicle* vehicle)
             {
-                if (!vehicle || !vehicle->m_pRwClump)
-                    return;
                 if (vehicle->m_nVehicleClass != VEHICLE_AUTOMOBILE &&
                     vehicle->m_nVehicleClass != VEHICLE_HELI)
                     return;
-                SlideDoor::Update(static_cast<CAutomobile*>(vehicle), true);
+                SlideDoor::Update(static_cast<CAutomobile*>(vehicle));
             };
 
         Events::processScriptsEvent += []
             {
-                SlideDoor::UpdateAllHelis();
+                for (CVehicle* vehicle : SlideDoor::g_activeHelis)
+                {
+                    if (vehicle)
+                        SlideDoor::Update(static_cast<CAutomobile*>(vehicle));
+                }
             };
 
         Events::vehicleDtorEvent.before += [](CVehicle* vehicle)
