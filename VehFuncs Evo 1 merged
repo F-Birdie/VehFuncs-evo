@@ -1,16 +1,19 @@
 // =============================================================================
-// VehFuncs Evo 1
-// Faithful merge of the five original codes
-// (Slide Door section updated to the corrected version)
+// VehFuncs Evo 1  (revision 4)
 // GTA SA 1.0 US, plugin-sdk
 //
-// Changes vs. previous revision:
-//   1. Belt & Chain: removed per-frame leak, per-model cached scrollers with
-//      cleanup, once-per-model-per-frame guard preserved.
-//   2. IVF Light Fix: install guard + static thread args.
-//   3. Moving Light Dummies: per-vehicle frame cache invalidated on model change.
-//   4. Angle Override / Slide Door: RwFrameGetParent instead of a full
-//      parent map. Heli workaround (vtable hook, UpdateAllHelis, maxNode) untouched.
+// Revision 2 (verified in game): Belt & Chain leak/cache fixes, IVF install guard,
+//   Moving Light Dummies cache invalidation, RwFrameGetParent instead of parent maps.
+//
+// Revision 3 (verified in game):
+//   B. ProcessOpenDoor: separate original pointer per vtable (both slots were confirmed
+//      to be the same function, so behaviour is identical).
+//   C. RedirectCalls uses hardcoded call sites (each verified before patching, with
+//      automatic fallback to the old scan if any fails).
+//   D. Angle Override + Slide Door merged into one per-vehicle scan ("DoorOverrides").
+//      The heli path (vtable hook, UpdateAllHelis, maxNode) is unchanged.
+//
+// Revision 4 (this file): debug logging removed. No functional change.
 // =============================================================================
 
 #include "plugin.h"
@@ -270,6 +273,16 @@ namespace MovingLightDummies
     constexpr unsigned PREPROCESS_HIERARCHY = 0x4C8E60;
     constexpr unsigned DO_VEHICLE_LIGHTS = 0x6E1A60;
 
+    // -------------------------------------------------------------------------
+    // Optional hardcoded call sites (0-terminated lists).
+    // Addresses found for GTA SA 1.0 US.
+    // Each entry is verified before patching; if any entry fails to verify, the old
+    // full scan runs as a fallback, so a wrong or stale list can't break the mod.
+    // -------------------------------------------------------------------------
+    static const unsigned kPreprocessSites[] = { 0x004C9638, 0 };
+    static const unsigned kDoLightsSites[] = {
+        0x006ABCB9, 0x006BD65F, 0x006F5592, 0x006F55A1, 0x006F55B4, 0 };
+
     using PreprocessFn = void(__thiscall*)(CVehicleModelInfo*);
     using DoLightsFn = void(__thiscall*)(CVehicle*, CMatrix*, unsigned);
     static PreprocessFn origPreprocess = reinterpret_cast<PreprocessFn>(PREPROCESS_HIERARCHY);
@@ -489,12 +502,36 @@ namespace MovingLightDummies
             dummies[i] = saved[i];
     }
 
-    static void RedirectCalls(unsigned target, void* hook) {
+    // True if the 5-byte instruction at `a` is a relative CALL resolving to `target`.
+    static bool IsCallTo(unsigned a, unsigned target) {
+        if (*reinterpret_cast<const uint8_t*>(a) != 0xE8)
+            return false;
+        const int32_t rel = *reinterpret_cast<const int32_t*>(a + 1);
+        return a + 5 + rel == target;
+    }
+
+    // Patches every call to `target` so it calls `hook`.
+    // Uses the hardcoded list when given (each entry verified); if any entry fails
+    // verification, or no list is given, falls back to the full byte scan.
+    static void RedirectCalls(unsigned target, void* hook, const unsigned* sites) {
+        int listed = 0;
+        int verified = 0;
+
+        if (sites) {
+            for (const unsigned* s = sites; *s; ++s) {
+                ++listed;
+                if (IsCallTo(*s, target)) {
+                    patch::RedirectCall(*s, hook);
+                    ++verified;
+                }
+            }
+        }
+
+        if (listed > 0 && verified == listed)
+            return;
+
         for (unsigned a = 0x401000; a < 0x857000 - 5; ++a) {
-            if (*reinterpret_cast<const uint8_t*>(a) != 0xE8)
-                continue;
-            const int32_t rel = *reinterpret_cast<const int32_t*>(a + 1);
-            if (a + 5 + rel == target)
+            if (IsCallTo(a, target))
                 patch::RedirectCall(a, hook);
         }
     }
@@ -502,8 +539,10 @@ namespace MovingLightDummies
     class Plugin {
     public:
         Plugin() {
-            RedirectCalls(PREPROCESS_HIERARCHY, reinterpret_cast<void*>(&PreprocessHook));
-            RedirectCalls(DO_VEHICLE_LIGHTS, reinterpret_cast<void*>(&DoVehicleLightsHook));
+            RedirectCalls(PREPROCESS_HIERARCHY,
+                reinterpret_cast<void*>(&PreprocessHook), kPreprocessSites);
+            RedirectCalls(DO_VEHICLE_LIGHTS,
+                reinterpret_cast<void*>(&DoVehicleLightsHook), kDoLightsSites);
 
             // Drop cached frame pointers when the vehicle's model changes,
             // so a recycled clump address can never leave dangling RwFrame*.
@@ -514,107 +553,13 @@ namespace MovingLightDummies
 }
 
 // =============================================================================
-// 3. Angle Override
+// 3. Door Overrides (Angle Override + Slide Door, merged)
+//    f_ang=<deg>        on the parent of a door/bonnet/boot dummy: open angle override
+//    f_sld=<x>,<y>,<z>  on the parent of a door dummy: sliding offset
+//    One scan per vehicle. Heli path (vtable hook, UpdateAllHelis, maxNode) preserved.
 // =============================================================================
 
-namespace AngleOverride
-{
-    static bool CarNodeToDoorIndex(eCarNodes node, int& outDoorIndex)
-    {
-        switch (node)
-        {
-        case CAR_BONNET:   outDoorIndex = 0; return true;
-        case CAR_BOOT:     outDoorIndex = 1; return true;
-        case CAR_DOOR_LF:  outDoorIndex = 2; return true;
-        case CAR_DOOR_RF:  outDoorIndex = 3; return true;
-        case CAR_DOOR_LR:  outDoorIndex = 4; return true;
-        case CAR_DOOR_RR:  outDoorIndex = 5; return true;
-        default:           return false;
-        }
-    }
-
-    static bool TryGetAngleOverrideRadians(RwFrame* parentFrame, float& outRadians)
-    {
-        if (!parentFrame) return false;
-
-        char* parentName = GetFrameNodeName(parentFrame);
-        if (!parentName) return false;
-
-        const char* prefix = "f_ang=";
-        const size_t prefixLen = 6;
-        if (strncmp(parentName, prefix, prefixLen) != 0) return false;
-
-        char* end = nullptr;
-        long degrees = strtol(parentName + prefixLen, &end, 10);
-        if (end == parentName + prefixLen) return false;
-
-        outRadians = degrees * (3.14159265f / 180.0f);
-        return true;
-    }
-
-    static std::unordered_map<CVehicle*, bool> g_processedVehicles;
-
-    static void ScanVehicle(CAutomobile* automobile)
-    {
-        CVehicle* vehicle = static_cast<CVehicle*>(automobile);
-        if (g_processedVehicles[vehicle]) return;
-
-        if (!vehicle->m_pRwClump)
-        {
-            g_processedVehicles[vehicle] = true;
-            return;
-        }
-
-        for (int node = CAR_NODE_NONE; node < CAR_NUM_NODES; ++node)
-        {
-            RwFrame* dummyFrame = automobile->m_aCarNodes[node];
-            if (!dummyFrame) continue;
-
-            int doorIndex;
-            if (!CarNodeToDoorIndex(static_cast<eCarNodes>(node), doorIndex))
-                continue;
-
-            RwFrame* parentFrame = RwFrameGetParent(dummyFrame);
-
-            float radians;
-            if (TryGetAngleOverrideRadians(parentFrame, radians))
-            {
-                automobile->m_doors[doorIndex].m_fOpenAngle = radians;
-            }
-        }
-
-        g_processedVehicles[vehicle] = true;
-    }
-
-    class Plugin
-    {
-    public:
-        Plugin()
-        {
-            Events::vehicleSetModelEvent += [](CVehicle* vehicle, int)
-                {
-                    g_processedVehicles[vehicle] = false;
-                };
-
-            Events::vehicleRenderEvent.before += [](CVehicle* vehicle)
-                {
-                    if (vehicle->m_nVehicleClass != VEHICLE_AUTOMOBILE) return;
-                    ScanVehicle(static_cast<CAutomobile*>(vehicle));
-                };
-
-            Events::vehicleDtorEvent.before += [](CVehicle* vehicle)
-                {
-                    g_processedVehicles.erase(vehicle);
-                };
-        }
-    } gPlugin;
-}
-
-// =============================================================================
-// 4. Slide Door (corrected version)
-// =============================================================================
-
-namespace SlideDoor
+namespace DoorOverrides
 {
     static bool CarNodeToDoorIndex(eCarNodes node, int& outDoorIndex)
     {
@@ -633,6 +578,20 @@ namespace SlideDoor
     static int MaxNodeForVehicle(bool isHeli)
     {
         return isHeli ? (HELI_DOOR_LR + 1) : CAR_NUM_NODES;
+    }
+
+    static bool TryGetAngleOverrideRadians(const char* parentName, float& outRadians)
+    {
+        const char* prefix = "f_ang=";
+        const size_t prefixLen = 6;
+        if (strncmp(parentName, prefix, prefixLen) != 0) return false;
+
+        char* end = nullptr;
+        long degrees = strtol(parentName + prefixLen, &end, 10);
+        if (end == parentName + prefixLen) return false;
+
+        outRadians = degrees * (3.14159265f / 180.0f);
+        return true;
     }
 
     static bool TryGetSlideOverride(const char* parentName, CVector& outOffset)
@@ -795,6 +754,8 @@ namespace SlideDoor
         RwFrameUpdateObjects(frame);
     }
 
+    // Single scan: picks up both f_ang= (cars only, applied immediately to the door's
+    // open angle) and f_sld= (cars and helis, stored for per-frame application).
     static void ScanVehicle(CAutomobile* automobile, SlideData& data, bool isHeli)
     {
         CVehicle* vehicle = static_cast<CVehicle*>(automobile);
@@ -807,7 +768,8 @@ namespace SlideDoor
             return;
         }
 
-        int maxNode = MaxNodeForVehicle(isHeli);
+        const bool applyAngle = vehicle->m_nVehicleClass == VEHICLE_AUTOMOBILE;
+        const int maxNode = MaxNodeForVehicle(isHeli);
 
         for (int node = CAR_NODE_NONE; node < maxNode; ++node)
         {
@@ -823,6 +785,13 @@ namespace SlideDoor
 
             char* parentName = GetFrameNodeName(parentFrame);
             if (!parentName) continue;
+
+            float radians;
+            if (applyAngle && TryGetAngleOverrideRadians(parentName, radians))
+            {
+                automobile->m_doors[doorIndex].m_fOpenAngle = radians;
+                continue;
+            }
 
             CVector offset;
             if (!TryGetSlideOverride(parentName, offset))
@@ -885,14 +854,15 @@ namespace SlideDoor
         }
     }
 
+    // -------------------------------------------------------------------------
+    // ProcessOpenDoor vtable hooks (slot 28), one original per vtable.
+    // -------------------------------------------------------------------------
     using ProcessOpenDoor_t = void(__thiscall*)(CVehicle*, CPed*, uint32_t, uint32_t, uint32_t, float);
-    static ProcessOpenDoor_t Real_ProcessOpenDoor = nullptr;
+    static ProcessOpenDoor_t Real_Auto = nullptr;   // CAutomobile vtable 0x871120
+    static ProcessOpenDoor_t Real_Heli = nullptr;   // CHeli vtable       0x871680
 
-    static void __fastcall ProcessOpenDoor_Hook(CVehicle* self, void*, CPed* ped,
-        uint32_t doorComponentId, uint32_t arg2, uint32_t arg3, float arg4)
+    static void AfterProcessOpenDoor(CVehicle* self)
     {
-        Real_ProcessOpenDoor(self, ped, doorComponentId, arg2, arg3, arg4);
-
         if (!self)
             return;
         if (self->m_nVehicleClass != VEHICLE_AUTOMOBILE &&
@@ -902,43 +872,63 @@ namespace SlideDoor
         Update(static_cast<CAutomobile*>(self));
     }
 
-    static void PatchProcessOpenDoorSlot(uintptr_t* vmt)
+    static void __fastcall ProcessOpenDoor_Hook_Auto(CVehicle* self, void*, CPed* ped,
+        uint32_t doorComponentId, uint32_t arg2, uint32_t arg3, float arg4)
+    {
+        Real_Auto(self, ped, doorComponentId, arg2, arg3, arg4);
+        AfterProcessOpenDoor(self);
+    }
+
+    static void __fastcall ProcessOpenDoor_Hook_Heli(CVehicle* self, void*, CPed* ped,
+        uint32_t doorComponentId, uint32_t arg2, uint32_t arg3, float arg4)
+    {
+        Real_Heli(self, ped, doorComponentId, arg2, arg3, arg4);
+        AfterProcessOpenDoor(self);
+    }
+
+    static void PatchProcessOpenDoorSlot(uintptr_t* vmt, ProcessOpenDoor_t* real, void* hook)
     {
         if (!vmt) return;
 
         const int slot = 28;
+        if (vmt[slot] == reinterpret_cast<uintptr_t>(hook))
+            return;                                   // already installed
+
         DWORD oldProt;
         if (!VirtualProtect(&vmt[slot], sizeof(uintptr_t), PAGE_READWRITE, &oldProt))
             return;
 
-        if (!Real_ProcessOpenDoor)
-            Real_ProcessOpenDoor = reinterpret_cast<ProcessOpenDoor_t>(vmt[slot]);
+        if (!*real)
+            *real = reinterpret_cast<ProcessOpenDoor_t>(vmt[slot]);
 
-        vmt[slot] = reinterpret_cast<uintptr_t>(&ProcessOpenDoor_Hook);
+        vmt[slot] = reinterpret_cast<uintptr_t>(hook);
 
         VirtualProtect(&vmt[slot], sizeof(uintptr_t), oldProt, &oldProt);
     }
 
     static void InstallProcessOpenDoorHooks()
     {
-        PatchProcessOpenDoorSlot(reinterpret_cast<uintptr_t*>(0x871120)); // CAutomobile
-        PatchProcessOpenDoorSlot(reinterpret_cast<uintptr_t*>(0x871680)); // CHeli
+        uintptr_t* autoVmt = reinterpret_cast<uintptr_t*>(0x871120);   // CAutomobile
+        uintptr_t* heliVmt = reinterpret_cast<uintptr_t*>(0x871680);   // CHeli
+
+        PatchProcessOpenDoorSlot(autoVmt, &Real_Auto, reinterpret_cast<void*>(&ProcessOpenDoor_Hook_Auto));
+        PatchProcessOpenDoorSlot(heliVmt, &Real_Heli, reinterpret_cast<void*>(&ProcessOpenDoor_Hook_Heli));
     }
 }
 
-class SlideDoorPlugin
+class DoorOverridesPlugin
 {
 public:
-    SlideDoorPlugin()
+    DoorOverridesPlugin()
     {
         Events::initRwEvent += []
             {
-                SlideDoor::InstallProcessOpenDoorHooks();
+                DoorOverrides::InstallProcessOpenDoorHooks();
             };
 
         Events::vehicleSetModelEvent += [](CVehicle* vehicle, int)
             {
-                SlideDoor::OnVehicleModelChanged(vehicle);
+                DoorOverrides::OnVehicleModelChanged(vehicle);
             };
 
         Events::vehicleRenderEvent.before += [](CVehicle* vehicle)
@@ -946,23 +936,23 @@ public:
                 if (vehicle->m_nVehicleClass != VEHICLE_AUTOMOBILE &&
                     vehicle->m_nVehicleClass != VEHICLE_HELI)
                     return;
-                SlideDoor::Update(static_cast<CAutomobile*>(vehicle));
+                DoorOverrides::Update(static_cast<CAutomobile*>(vehicle));
             };
 
         Events::processScriptsEvent += []
             {
-                SlideDoor::UpdateAllHelis();
+                DoorOverrides::UpdateAllHelis();
             };
 
         Events::vehicleDtorEvent.before += [](CVehicle* vehicle)
             {
-                SlideDoor::OnVehicleDestroyed(vehicle);
+                DoorOverrides::OnVehicleDestroyed(vehicle);
             };
     }
-} slideDoorPlugin;
+} doorOverridesPlugin;
 
 // =============================================================================
-// 5. Belt & Chain
+// 4. Belt & Chain
 // =============================================================================
 
 namespace BeltAndChain
