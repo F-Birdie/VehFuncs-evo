@@ -1,0 +1,1134 @@
+// =============================================================================
+// VehFuncs Evo 1
+// Faithful merge of the five original codes
+// (Slide Door section updated to the corrected version)
+// GTA SA 1.0 US, plugin-sdk
+//
+// Changes vs. previous revision:
+//   1. Belt & Chain: removed per-frame leak, per-model cached scrollers with
+//      cleanup, once-per-model-per-frame guard preserved.
+//   2. IVF Light Fix: install guard + static thread args.
+//   3. Moving Light Dummies: per-vehicle frame cache invalidated on model change.
+//   4. Angle Override / Slide Door: RwFrameGetParent instead of a full
+//      parent map. Heli workaround (vtable hook, UpdateAllHelis, maxNode) untouched.
+// =============================================================================
+
+#include "plugin.h"
+#include "CVehicle.h"
+#include "CAutomobile.h"
+#include "CHeli.h"
+#include "CPools.h"
+#include "CTimer.h"
+#include "CModelInfo.h"
+#include "CVehicleModelInfo.h"
+#include "NodeName.h"
+#include "RenderWare.h"
+#include "common.h"
+
+#include <windows.h>
+#include <cstdint>
+#include <cstring>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+#include <algorithm>
+#include <cstdlib>
+#include <cmath>
+
+using namespace plugin;
+
+// =============================================================================
+// 1. IVF Light Fix
+// =============================================================================
+
+namespace IVF_LightFix
+{
+    static const uintptr_t kExtrasCallSite = 0x71B8;
+    static const uintptr_t kFrameStackOffset = 0x160;
+    static const uintptr_t kFrameEbpOffset = 0x08;
+    static constexpr uintptr_t ADDR_RegisterCorona = 0x6FC180;
+
+    static DWORD gMainThreadId = 0;
+    static CVector gCorrectedPos;
+
+    static bool Rd32(uintptr_t a, uint32_t* out) {
+        __try { *out = *(volatile uint32_t*)a; return true; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+
+    static bool PlausiblePtr(uintptr_t p) {
+        return p >= 0x10000 && p < 0xFFFF0000 && (p & 3) == 0;
+    }
+
+    static bool IsFrame(uintptr_t p) {
+        if (!PlausiblePtr(p)) return false;
+        RwFrame* f = (RwFrame*)p;
+        uint32_t root = 0, rootroot = 0, parent = 0;
+        if (!Rd32((uintptr_t)&f->root, &root)) return false;
+        if (!PlausiblePtr(root)) return false;
+        if (!Rd32((uintptr_t) & ((RwFrame*)root)->root, &rootroot)) return false;
+        if (rootroot != root) return false;
+        return Rd32((uintptr_t)&f->object.parent, &parent);
+    }
+
+    static bool InChildList(uintptr_t f, uintptr_t parent) {
+        uint32_t c = 0;
+        if (!Rd32((uintptr_t) & ((RwFrame*)parent)->child, &c)) return false;
+        for (int i = 0; i < 512 && c; ++i) {
+            if (c == f) return true;
+            uint32_t nx = 0;
+            if (!Rd32((uintptr_t) & ((RwFrame*)c)->next, &nx)) return false;
+            c = nx;
+        }
+        return false;
+    }
+
+    static bool ReachableFromRoot(uintptr_t f, uintptr_t root) {
+        for (int i = 0; i < 64; ++i) {
+            if (f == root) return true;
+            uint32_t par = 0;
+            if (!Rd32((uintptr_t) & ((RwFrame*)f)->object.parent, &par) || par == 0) return false;
+            if (!InChildList(f, par)) return false;
+            f = par;
+        }
+        return false;
+    }
+
+    static bool IsEmptyFrame(uintptr_t f) {
+        uint32_t child = 0;
+        if (!Rd32((uintptr_t) & ((RwFrame*)f)->child, &child)) return true;
+        if (child != 0) return false;
+        uintptr_t listHead = (uintptr_t) & ((RwFrame*)f)->child - 8;
+        uint32_t next = 0;
+        if (!Rd32(listHead, &next)) return true;
+        return next == (uint32_t)listHead;
+    }
+
+    static int Evaluate(uint32_t frame, uintptr_t clumpRoot) {
+        if (!IsFrame(frame)) return 1;
+        if (clumpRoot && !ReachableFromRoot(frame, clumpRoot)) return 2;
+        if (!IsEmptyFrame(frame)) return 3;
+        return 0;
+    }
+
+    static bool IsCarNodeName(const char* name) {
+        if (!name) return false;
+        return strstr(name, "bonnet_dummy") || strstr(name, "boot_dummy") ||
+            strstr(name, "door_lf_dummy") || strstr(name, "door_rf_dummy") ||
+            strstr(name, "door_lr_dummy") || strstr(name, "door_rr_dummy") ||
+            strstr(name, "wing_lf_dummy") || strstr(name, "wing_rf_dummy") ||
+            strstr(name, "bump_front_dummy") || strstr(name, "bump_rear_dummy");
+    }
+
+    static bool NestedUnderCarNode(RwFrame* frame, RwFrame* root) {
+        __try {
+            RwFrame* parent = (RwFrame*)frame->object.parent;
+            if (!parent || parent == root) return false;
+            RwFrame* p = (RwFrame*)parent->object.parent;
+            for (int i = 0; i < 64 && p && p != root; ++i, p = (RwFrame*)p->object.parent)
+                if (IsCarNodeName(GetFrameNodeName(p))) return true;
+            return false;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+
+    static bool VehicleSpacePos(RwFrame* frame, RwFrame* root, CVector* out) {
+        __try {
+            float x = frame->modelling.pos.x, y = frame->modelling.pos.y, z = frame->modelling.pos.z;
+            RwFrame* a = (RwFrame*)frame->object.parent;
+            for (int i = 0; i < 64 && a && a != root; ++i, a = (RwFrame*)a->object.parent) {
+                const RwMatrix& m = a->modelling;
+                float nx = m.right.x * x + m.up.x * y + m.at.x * z + m.pos.x;
+                float ny = m.right.y * x + m.up.y * y + m.at.y * z + m.pos.y;
+                float nz = m.right.z * x + m.up.z * y + m.at.z * z + m.pos.z;
+                x = nx; y = ny; z = nz;
+            }
+            if (a != root) return false;
+            out->x = x; out->y = y; out->z = z;
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+
+    static LONG CALLBACK BreakpointHandler(PEXCEPTION_POINTERS ei) {
+        if (ei->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
+        if ((uintptr_t)ei->ExceptionRecord->ExceptionAddress != ADDR_RegisterCorona) return EXCEPTION_CONTINUE_SEARCH;
+        if (GetCurrentThreadId() != gMainThreadId) return EXCEPTION_CONTINUE_SEARCH;
+
+        PCONTEXT ctx = ei->ContextRecord;
+        const uint32_t* sp = (const uint32_t*)ctx->Esp;
+
+        bool drop = false;
+        const uintptr_t ret = sp[0];
+
+        HMODULE callerMod = nullptr;
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            (LPCSTR)ret, &callerMod) && callerMod)
+        {
+            uintptr_t base = (uintptr_t)callerMod;
+            if ((ret - base) == kExtrasCallSite) {
+                const uint32_t attach = sp[2];
+
+                uint32_t typeWord = 0;
+                if (attach && Rd32((uintptr_t)attach + 0x34, &typeWord) &&
+                    ((typeWord >> 16) & 7) == 2)
+                {
+                    CVehicle* veh = (CVehicle*)(uintptr_t)attach;
+
+                    uint32_t clump = 0, root = 0;
+                    Rd32((uintptr_t)&veh->m_pRwClump, &clump);
+                    if (clump) Rd32((uintptr_t) & ((RwObject*)(uintptr_t)clump)->parent, &root);
+
+                    uint32_t frame = 0;
+                    Rd32(ctx->Esp + kFrameStackOffset, &frame);
+                    if (!IsFrame(frame)) {
+                        uint32_t alt = 0;
+                        if (Rd32(ctx->Ebp + kFrameEbpOffset, &alt) && IsFrame(alt)) frame = alt;
+                    }
+
+                    if (frame != 0 && root != 0) {
+                        int reason = Evaluate(frame, root);
+                        if (reason != 0) {
+                            drop = true;
+                        }
+                        else if (NestedUnderCarNode((RwFrame*)(uintptr_t)frame, (RwFrame*)(uintptr_t)root) &&
+                            VehicleSpacePos((RwFrame*)(uintptr_t)frame, (RwFrame*)(uintptr_t)root, &gCorrectedPos)) {
+                            ((uint32_t*)ctx->Esp)[7] = (uint32_t)(uintptr_t)&gCorrectedPos;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (drop) {
+            ctx->Eip = (DWORD)ret;
+            ctx->Esp += 4;
+        }
+        else {
+            ctx->EFlags |= 0x10000;
+        }
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    struct InstallArgs { DWORD tid; bool ok; };
+
+    // Static so the worker thread can never write into a dead stack frame,
+    // even if the wait below times out.
+    static InstallArgs g_installArgs;
+    static bool g_installed = false;
+
+    static DWORD WINAPI InstallThread(LPVOID p) {
+        auto* args = (InstallArgs*)p;
+        HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, args->tid);
+        if (!h) return 0;
+        if (SuspendThread(h) != (DWORD)-1) {
+            CONTEXT c = {};
+            c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            if (GetThreadContext(h, &c)) {
+                c.Dr0 = (DWORD)ADDR_RegisterCorona;
+                c.Dr7 &= ~0x000F0003u;
+                c.Dr7 |= 0x1;
+                c.Dr6 = 0;
+                args->ok = SetThreadContext(h, &c) != FALSE;
+            }
+            ResumeThread(h);
+        }
+        CloseHandle(h);
+        return 0;
+    }
+
+    static void InstallBreakpoint() {
+        if (g_installed) return;            // never add the handler twice
+        g_installed = true;
+
+        gMainThreadId = GetCurrentThreadId();
+        AddVectoredExceptionHandler(1, BreakpointHandler);
+
+        g_installArgs = { gMainThreadId, false };
+        HANDLE t = CreateThread(nullptr, 0, InstallThread, &g_installArgs, 0, nullptr);
+        if (t) { WaitForSingleObject(t, 5000); CloseHandle(t); }
+    }
+
+    class Plugin {
+    public:
+        Plugin() {
+            Events::initGameEvent += [] {
+                InstallBreakpoint();
+                };
+        }
+    } gPlugin;
+}
+
+// =============================================================================
+// 2. Moving Light Dummies
+// =============================================================================
+
+namespace MovingLightDummies
+{
+    constexpr unsigned PREPROCESS_HIERARCHY = 0x4C8E60;
+    constexpr unsigned DO_VEHICLE_LIGHTS = 0x6E1A60;
+
+    using PreprocessFn = void(__thiscall*)(CVehicleModelInfo*);
+    using DoLightsFn = void(__thiscall*)(CVehicle*, CMatrix*, unsigned);
+    static PreprocessFn origPreprocess = reinterpret_cast<PreprocessFn>(PREPROCESS_HIERARCHY);
+    static DoLightsFn   origDoVehicleLights = reinterpret_cast<DoLightsFn>(DO_VEHICLE_LIGHTS);
+
+    static const char* kLightNames[4] = { "headlights", "taillights", "headlights2", "taillights2" };
+    static const char* kMovingParts[] = {
+        "bonnet_dummy", "boot_dummy",
+        "door_lf_dummy", "door_rf_dummy", "door_lr_dummy", "door_rr_dummy",
+    };
+
+    constexpr bool kStopLightsWhenPartDamaged = true;
+    static bool IsDamagedStatus(unsigned status) { return status == 1 || status == 3 || status == 4; }
+
+    static int DoorIndexOf(const char* name) {
+        if (_stricmp(name, "bonnet_dummy") == 0)  return 0;
+        if (_stricmp(name, "boot_dummy") == 0)    return 1;
+        if (_stricmp(name, "door_lf_dummy") == 0) return 2;
+        if (_stricmp(name, "door_rf_dummy") == 0) return 3;
+        if (_stricmp(name, "door_lr_dummy") == 0) return 4;
+        if (_stricmp(name, "door_rr_dummy") == 0) return 5;
+        return -1;
+    }
+
+    struct FindCtx {
+        const char* name;
+        RwFrame* found;
+    };
+
+    static RwFrame* FindFrameCB(RwFrame* frame, void* data) {
+        auto* ctx = static_cast<FindCtx*>(data);
+        const char* n = GetFrameNodeName(frame);
+        if (n && _stricmp(n, ctx->name) == 0) {
+            ctx->found = frame;
+            return nullptr;
+        }
+        RwFrameForAllChildren(frame, FindFrameCB, ctx);
+        return ctx->found ? nullptr : frame;
+    }
+
+    static RwFrame* FindFrame(RwFrame* root, const char* name) {
+        FindCtx ctx = { name, nullptr };
+        RwFrameForAllChildren(root, FindFrameCB, &ctx);
+        return ctx.found;
+    }
+
+    static bool IsMovingPart(const char* name) {
+        for (const char* part : kMovingParts) {
+            if (_stricmp(name, part) == 0)
+                return true;
+        }
+        return false;
+    }
+
+    struct Link {
+        bool        valid = false;
+        std::string part;
+        RwV3d       local{};
+        int         door = -1;
+    };
+    struct ModelLinks {
+        bool any = false;
+        Link slot[4];
+    };
+    static std::unordered_map<const void*, ModelLinks> g_links;
+
+    static void CaptureLinks(CVehicleModelInfo* mi, RpClump* clump) {
+        ModelLinks links;
+        RwFrame* root = RpClumpGetFrame(clump);
+
+        for (int i = 0; i < 4; i++) {
+            RwFrame* dummy = FindFrame(root, kLightNames[i]);
+            if (!dummy)
+                continue;
+
+            RwV3d p = RwFrameGetMatrix(dummy)->pos;
+            for (RwFrame* f = RwFrameGetParent(dummy); f && f != root; f = RwFrameGetParent(f)) {
+                const char* n = GetFrameNodeName(f);
+                if (n && IsMovingPart(n)) {
+                    links.slot[i].valid = true;
+                    links.slot[i].part = n;
+                    links.slot[i].local = p;
+                    links.slot[i].door = DoorIndexOf(n);
+                    links.any = true;
+                    break;
+                }
+                RwV3dTransformPoints(&p, &p, 1, RwFrameGetMatrix(f));
+            }
+        }
+
+        if (links.any)
+            g_links[mi] = links;
+        else
+            g_links.erase(mi);
+    }
+
+    static void __fastcall PreprocessHook(CVehicleModelInfo* mi, void*) {
+        if (RpClump* clump = reinterpret_cast<RpClump*>(mi->m_pRwObject))
+            CaptureLinks(mi, clump);
+        origPreprocess(mi);
+    }
+
+    struct VehicleFrames {
+        RpClump* clump = nullptr;
+        RwFrame* part[4] = {};
+    };
+    static std::unordered_map<CVehicle*, VehicleFrames> g_vehicles;
+
+    static CVector CurrentPos(RpClump* clump, RwFrame* part, const RwV3d& local) {
+        RwFrame* root = RpClumpGetFrame(clump);
+        RwV3d p = local;
+        for (RwFrame* f = part; f && f != root; f = RwFrameGetParent(f))
+            RwV3dTransformPoints(&p, &p, 1, RwFrameGetMatrix(f));
+        return CVector(p.x, p.y, p.z);
+    }
+
+    static bool HasDamageManager(CVehicle* v) {
+        const unsigned vmt = *reinterpret_cast<unsigned*>(v);
+        return vmt == 0x871120 || vmt == 0x871948;
+    }
+
+    struct PartState {
+        bool anyOk = false, anyDam = false;
+        bool okVisible = false, damVisible = false;
+    };
+
+    static RpAtomic* __cdecl PartAtomicCB(RpAtomic* atomic, void* data) {
+        auto* s = static_cast<PartState*>(data);
+        const uint8_t* b = reinterpret_cast<const uint8_t*>(atomic);
+        const int pluginOffset = *reinterpret_cast<const int*>(0x008D608C);
+        const unsigned compFlags = *reinterpret_cast<const uint16_t*>(b + pluginOffset + 2);
+        const bool visible = (atomic->object.object.flags & 0x4) != 0;
+
+        if (compFlags & 1) { s->anyOk = true;  s->okVisible |= visible; }
+        if (compFlags & 2) { s->anyDam = true; s->damVisible |= visible; }
+        return atomic;
+    }
+
+    static RwFrame* __cdecl PartFrameCB(RwFrame* frame, void* data) {
+        RwFrameForAllObjects(frame, reinterpret_cast<RwObjectCallBack>(PartAtomicCB), data);
+        RwFrameForAllChildren(frame, PartFrameCB, data);
+        return frame;
+    }
+
+    static bool PartIsBroken(RwFrame* part, unsigned fallbackStatus) {
+        PartState s;
+        PartFrameCB(part, &s);
+
+        if (!s.anyOk && !s.anyDam)
+            return IsDamagedStatus(fallbackStatus);
+
+        if (s.anyDam && s.damVisible)
+            return true;
+        if (s.anyOk && !s.okVisible && !s.damVisible)
+            return true;
+        return false;
+    }
+
+    void __fastcall DoVehicleLightsHook(CVehicle* self, void*, CMatrix* matrix, unsigned flags) {
+        auto* mi = static_cast<CVehicleModelInfo*>(CModelInfo::GetModelInfo(self->m_nModelIndex));
+        const auto it = mi ? g_links.find(mi) : g_links.end();
+        if (it == g_links.end() || !mi->m_pVehicleStruct || !self->m_pRwClump) {
+            origDoVehicleLights(self, matrix, flags);
+            return;
+        }
+
+        const ModelLinks& links = it->second;
+        VehicleFrames& vf = g_vehicles[self];
+        if (vf.clump != self->m_pRwClump) {
+            vf.clump = self->m_pRwClump;
+            for (int i = 0; i < 4; i++)
+                vf.part[i] = links.slot[i].valid ? FindFrame(RpClumpGetFrame(vf.clump), links.slot[i].part.c_str()) : nullptr;
+        }
+
+        CVector* dummies = mi->m_pVehicleStruct->m_avDummyPos;
+        const CVector saved[4] = { dummies[0], dummies[1], dummies[2], dummies[3] };
+        for (int i = 0; i < 4; i++) {
+            if (links.slot[i].valid && vf.part[i])
+                dummies[i] = CurrentPos(vf.clump, vf.part[i], links.slot[i].local);
+        }
+
+        bool frontDead = false;
+        bool rearDead = false;
+        CDamageManager* dm = HasDamageManager(self) ? &static_cast<CAutomobile*>(self)->m_damageManager : nullptr;
+        if (kStopLightsWhenPartDamaged && dm) {
+            for (int i = 0; i < 4; i++) {
+                const Link& l = links.slot[i];
+                if (!l.valid || !vf.part[i])
+                    continue;
+                const unsigned status = l.door >= 0 ? dm->GetDoorStatus(static_cast<eDoors>(l.door)) : 0;
+                if (PartIsBroken(vf.part[i], status)) {
+                    if (i == 0 || i == 2)
+                        frontDead = true;
+                    else
+                        rearDead = true;
+                }
+            }
+        }
+
+        const bool kill[4] = { frontDead, frontDead, rearDead, rearDead };
+        unsigned savedLight[4] = {};
+        for (int l = 0; l < 4; l++) {
+            if (dm && kill[l]) {
+                savedLight[l] = dm->GetLightStatus(static_cast<eLights>(l));
+                dm->SetLightStatus(static_cast<eLights>(l), 1);
+            }
+        }
+
+        origDoVehicleLights(self, matrix, flags);
+
+        for (int l = 0; l < 4; l++) {
+            if (dm && kill[l])
+                dm->SetLightStatus(static_cast<eLights>(l), savedLight[l]);
+        }
+
+        for (int i = 0; i < 4; i++)
+            dummies[i] = saved[i];
+    }
+
+    static void RedirectCalls(unsigned target, void* hook) {
+        for (unsigned a = 0x401000; a < 0x857000 - 5; ++a) {
+            if (*reinterpret_cast<const uint8_t*>(a) != 0xE8)
+                continue;
+            const int32_t rel = *reinterpret_cast<const int32_t*>(a + 1);
+            if (a + 5 + rel == target)
+                patch::RedirectCall(a, hook);
+        }
+    }
+
+    class Plugin {
+    public:
+        Plugin() {
+            RedirectCalls(PREPROCESS_HIERARCHY, reinterpret_cast<void*>(&PreprocessHook));
+            RedirectCalls(DO_VEHICLE_LIGHTS, reinterpret_cast<void*>(&DoVehicleLightsHook));
+
+            // Drop cached frame pointers when the vehicle's model changes,
+            // so a recycled clump address can never leave dangling RwFrame*.
+            Events::vehicleSetModelEvent += [](CVehicle* veh, int) { g_vehicles.erase(veh); };
+            Events::vehicleDtorEvent += [](CVehicle* veh) { g_vehicles.erase(veh); };
+        }
+    } gPlugin;
+}
+
+// =============================================================================
+// 3. Angle Override
+// =============================================================================
+
+namespace AngleOverride
+{
+    static bool CarNodeToDoorIndex(eCarNodes node, int& outDoorIndex)
+    {
+        switch (node)
+        {
+        case CAR_BONNET:   outDoorIndex = 0; return true;
+        case CAR_BOOT:     outDoorIndex = 1; return true;
+        case CAR_DOOR_LF:  outDoorIndex = 2; return true;
+        case CAR_DOOR_RF:  outDoorIndex = 3; return true;
+        case CAR_DOOR_LR:  outDoorIndex = 4; return true;
+        case CAR_DOOR_RR:  outDoorIndex = 5; return true;
+        default:           return false;
+        }
+    }
+
+    static bool TryGetAngleOverrideRadians(RwFrame* parentFrame, float& outRadians)
+    {
+        if (!parentFrame) return false;
+
+        char* parentName = GetFrameNodeName(parentFrame);
+        if (!parentName) return false;
+
+        const char* prefix = "f_ang=";
+        const size_t prefixLen = 6;
+        if (strncmp(parentName, prefix, prefixLen) != 0) return false;
+
+        char* end = nullptr;
+        long degrees = strtol(parentName + prefixLen, &end, 10);
+        if (end == parentName + prefixLen) return false;
+
+        outRadians = degrees * (3.14159265f / 180.0f);
+        return true;
+    }
+
+    static std::unordered_map<CVehicle*, bool> g_processedVehicles;
+
+    static void ScanVehicle(CAutomobile* automobile)
+    {
+        CVehicle* vehicle = static_cast<CVehicle*>(automobile);
+        if (g_processedVehicles[vehicle]) return;
+
+        if (!vehicle->m_pRwClump)
+        {
+            g_processedVehicles[vehicle] = true;
+            return;
+        }
+
+        for (int node = CAR_NODE_NONE; node < CAR_NUM_NODES; ++node)
+        {
+            RwFrame* dummyFrame = automobile->m_aCarNodes[node];
+            if (!dummyFrame) continue;
+
+            int doorIndex;
+            if (!CarNodeToDoorIndex(static_cast<eCarNodes>(node), doorIndex))
+                continue;
+
+            RwFrame* parentFrame = RwFrameGetParent(dummyFrame);
+
+            float radians;
+            if (TryGetAngleOverrideRadians(parentFrame, radians))
+            {
+                automobile->m_doors[doorIndex].m_fOpenAngle = radians;
+            }
+        }
+
+        g_processedVehicles[vehicle] = true;
+    }
+
+    class Plugin
+    {
+    public:
+        Plugin()
+        {
+            Events::vehicleSetModelEvent += [](CVehicle* vehicle, int)
+                {
+                    g_processedVehicles[vehicle] = false;
+                };
+
+            Events::vehicleRenderEvent.before += [](CVehicle* vehicle)
+                {
+                    if (vehicle->m_nVehicleClass != VEHICLE_AUTOMOBILE) return;
+                    ScanVehicle(static_cast<CAutomobile*>(vehicle));
+                };
+
+            Events::vehicleDtorEvent.before += [](CVehicle* vehicle)
+                {
+                    g_processedVehicles.erase(vehicle);
+                };
+        }
+    } gPlugin;
+}
+
+// =============================================================================
+// 4. Slide Door (corrected version)
+// =============================================================================
+
+namespace SlideDoor
+{
+    static bool CarNodeToDoorIndex(eCarNodes node, int& outDoorIndex)
+    {
+        switch (node)
+        {
+        case CAR_BONNET:  outDoorIndex = 0; return true;
+        case CAR_BOOT:    outDoorIndex = 1; return true;
+        case CAR_DOOR_LF: outDoorIndex = 2; return true;
+        case CAR_DOOR_RF: outDoorIndex = 3; return true;
+        case CAR_DOOR_LR: outDoorIndex = 4; return true;
+        case CAR_DOOR_RR: outDoorIndex = 5; return true;
+        default: return false;
+        }
+    }
+
+    static int MaxNodeForVehicle(bool isHeli)
+    {
+        return isHeli ? (HELI_DOOR_LR + 1) : CAR_NUM_NODES;
+    }
+
+    static bool TryGetSlideOverride(const char* parentName, CVector& outOffset)
+    {
+        if (strncmp(parentName, "f_sld=", 6) != 0)
+            return false;
+
+        const char* cursor = parentName + 6;
+        char* end = nullptr;
+
+        float x = strtof(cursor, &end);
+        if (end == cursor || *end != ',') return false;
+        cursor = end + 1;
+
+        float y = strtof(cursor, &end);
+        if (end == cursor || *end != ',') return false;
+        cursor = end + 1;
+
+        float z = strtof(cursor, &end);
+        if (end == cursor) return false;
+
+        outOffset = CVector(x, y, z);
+        return true;
+    }
+
+    static constexpr float kSmallAxisSpeedRatio = 0.4f;
+
+    struct AxisSlices
+    {
+        float sliceStart[3] = {};
+        float sliceEnd[3] = {};
+    };
+
+    static AxisSlices ComputeAxisSlices(const CVector& offset, float smallAxisSpeedRatio)
+    {
+        AxisSlices result;
+        struct AxisEntry { int idx; float mag; };
+        std::vector<AxisEntry> active;
+
+        if (offset.x != 0.0f) active.push_back({ 0, std::fabs(offset.x) });
+        if (offset.y != 0.0f) active.push_back({ 1, std::fabs(offset.y) });
+        if (offset.z != 0.0f) active.push_back({ 2, std::fabs(offset.z) });
+        if (active.empty()) return result;
+
+        std::sort(active.begin(), active.end(),
+            [](const AxisEntry& a, const AxisEntry& b) { return a.mag < b.mag; });
+
+        int n = static_cast<int>(active.size());
+        if (n == 1)
+        {
+            result.sliceStart[active[0].idx] = 0.0f;
+            result.sliceEnd[active[0].idx] = 1.0f;
+            return result;
+        }
+
+        float r = std::max(smallAxisSpeedRatio, 0.001f);
+        float leadMag = active[n - 1].mag;
+        float sumSmallMag = 0.0f;
+        for (int i = 0; i < n - 1; ++i)
+            sumSmallMag += active[i].mag;
+
+        float leadSpeedUnit = leadMag + sumSmallMag / r;
+        float cursor = 0.0f;
+        for (int i = 0; i < n - 1; ++i)
+        {
+            float duration = active[i].mag / (r * leadSpeedUnit);
+            result.sliceStart[active[i].idx] = cursor;
+            result.sliceEnd[active[i].idx] = cursor + duration;
+            cursor += duration;
+        }
+        result.sliceStart[active[n - 1].idx] = cursor;
+        result.sliceEnd[active[n - 1].idx] = 1.0f;
+        return result;
+    }
+
+    struct SlideData
+    {
+        bool hasOverride[6] = {};
+        CVector slideOffset[6] = {};
+        CVector closedPosition[6] = {};
+        AxisSlices slices[6] = {};
+        bool scanned = false;
+    };
+
+    static std::unordered_map<CVehicle*, SlideData> g_slideData;
+
+    static bool IsHelicopter(CVehicle* vehicle)
+    {
+        if (!vehicle) return false;
+        if (vehicle->m_nVehicleClass == VEHICLE_HELI)
+            return true;
+
+        switch (vehicle->m_nModelIndex)
+        {
+        case 417: case 425: case 447: case 469:
+        case 487: case 488: case 497: case 548: case 563:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    static float ApplyAxisSlide(float closed, float offset, float ratio, float sliceStart, float sliceEnd)
+    {
+        if (offset == 0.0f) return closed;
+        float t;
+        if (ratio <= sliceStart) t = 0.0f;
+        else if (ratio >= sliceEnd) t = 1.0f;
+        else t = (ratio - sliceStart) / (sliceEnd - sliceStart);
+        return closed + offset * t;
+    }
+
+    static eCarNodes DoorIndexToNode(int doorIndex)
+    {
+        switch (doorIndex)
+        {
+        case 0: return CAR_BONNET;
+        case 1: return CAR_BOOT;
+        case 2: return CAR_DOOR_LF;
+        case 3: return CAR_DOOR_RF;
+        case 4: return CAR_DOOR_LR;
+        case 5: return CAR_DOOR_RR;
+        default: return CAR_NODE_NONE;
+        }
+    }
+
+    static void ApplySlideForDoor(CAutomobile* automobile, int doorIndex)
+    {
+        if (!automobile || doorIndex < 0 || doorIndex > 5)
+            return;
+
+        auto it = g_slideData.find(static_cast<CVehicle*>(automobile));
+        if (it == g_slideData.end() || !it->second.scanned || !it->second.hasOverride[doorIndex])
+            return;
+
+        SlideData& data = it->second;
+        eCarNodes node = DoorIndexToNode(doorIndex);
+        if (node == CAR_NODE_NONE)
+            return;
+
+        RwFrame* frame = automobile->m_aCarNodes[node];
+        if (!frame)
+            return;
+
+        float ratio = automobile->m_doors[doorIndex].GetAngleOpenRatio();
+        const CVector& offset = data.slideOffset[doorIndex];
+        const CVector& closed = data.closedPosition[doorIndex];
+        const AxisSlices& slices = data.slices[doorIndex];
+
+        CVector newPos(
+            ApplyAxisSlide(closed.x, offset.x, ratio, slices.sliceStart[0], slices.sliceEnd[0]),
+            ApplyAxisSlide(closed.y, offset.y, ratio, slices.sliceStart[1], slices.sliceEnd[1]),
+            ApplyAxisSlide(closed.z, offset.z, ratio, slices.sliceStart[2], slices.sliceEnd[2])
+        );
+
+        RwV3d rwPos{ newPos.x, newPos.y, newPos.z };
+        RwMatrix* rwMat = RwFrameGetMatrix(frame);
+        RwMatrixSetIdentity(rwMat);
+        RwMatrixTranslate(rwMat, &rwPos, rwCOMBINEREPLACE);
+        RwFrameUpdateObjects(frame);
+    }
+
+    static void ScanVehicle(CAutomobile* automobile, SlideData& data, bool isHeli)
+    {
+        CVehicle* vehicle = static_cast<CVehicle*>(automobile);
+        if (data.scanned)
+            return;
+
+        if (!vehicle->m_pRwClump)
+        {
+            data.scanned = true;
+            return;
+        }
+
+        int maxNode = MaxNodeForVehicle(isHeli);
+
+        for (int node = CAR_NODE_NONE; node < maxNode; ++node)
+        {
+            RwFrame* dummyFrame = automobile->m_aCarNodes[node];
+            if (!dummyFrame) continue;
+
+            int doorIndex;
+            if (!CarNodeToDoorIndex(static_cast<eCarNodes>(node), doorIndex))
+                continue;
+
+            RwFrame* parentFrame = RwFrameGetParent(dummyFrame);
+            if (!parentFrame) continue;
+
+            char* parentName = GetFrameNodeName(parentFrame);
+            if (!parentName) continue;
+
+            CVector offset;
+            if (!TryGetSlideOverride(parentName, offset))
+                continue;
+
+            data.hasOverride[doorIndex] = true;
+            data.slideOffset[doorIndex] = offset;
+            data.slices[doorIndex] = ComputeAxisSlices(offset, kSmallAxisSpeedRatio);
+
+            RwV3d* pos = RwMatrixGetPos(RwFrameGetMatrix(dummyFrame));
+            data.closedPosition[doorIndex] = CVector(pos->x, pos->y, pos->z);
+        }
+        data.scanned = true;
+    }
+
+    static void ApplySlideOverrides(CAutomobile* automobile, SlideData& data, bool isHeli)
+    {
+        (void)isHeli;
+        for (int i = 0; i < 6; ++i)
+        {
+            if (data.hasOverride[i])
+                ApplySlideForDoor(automobile, i);
+        }
+    }
+
+    void Update(CAutomobile* automobile)
+    {
+        CVehicle* vehicle = static_cast<CVehicle*>(automobile);
+        bool isHeli = IsHelicopter(vehicle);
+        SlideData& data = g_slideData[vehicle];
+        ScanVehicle(automobile, data, isHeli);
+        if (data.scanned)
+            ApplySlideOverrides(automobile, data, isHeli);
+    }
+
+    void OnVehicleModelChanged(CVehicle* vehicle)
+    {
+        g_slideData[vehicle] = SlideData{};
+    }
+
+    void OnVehicleDestroyed(CVehicle* vehicle)
+    {
+        g_slideData.erase(vehicle);
+    }
+
+    void UpdateAllHelis()
+    {
+        auto* pool = CPools::ms_pVehiclePool;
+        if (!pool)
+            return;
+
+        for (int i = 0; i < pool->m_nSize; ++i)
+        {
+            CVehicle* v = pool->GetAt(i);
+            if (!v || !v->m_pRwClump)
+                continue;
+            if (!IsHelicopter(v))
+                continue;
+            Update(static_cast<CAutomobile*>(v));
+        }
+    }
+
+    using ProcessOpenDoor_t = void(__thiscall*)(CVehicle*, CPed*, uint32_t, uint32_t, uint32_t, float);
+    static ProcessOpenDoor_t Real_ProcessOpenDoor = nullptr;
+
+    static void __fastcall ProcessOpenDoor_Hook(CVehicle* self, void*, CPed* ped,
+        uint32_t doorComponentId, uint32_t arg2, uint32_t arg3, float arg4)
+    {
+        Real_ProcessOpenDoor(self, ped, doorComponentId, arg2, arg3, arg4);
+
+        if (!self)
+            return;
+        if (self->m_nVehicleClass != VEHICLE_AUTOMOBILE &&
+            self->m_nVehicleClass != VEHICLE_HELI)
+            return;
+
+        Update(static_cast<CAutomobile*>(self));
+    }
+
+    static void PatchProcessOpenDoorSlot(uintptr_t* vmt)
+    {
+        if (!vmt) return;
+
+        const int slot = 28;
+        DWORD oldProt;
+        if (!VirtualProtect(&vmt[slot], sizeof(uintptr_t), PAGE_READWRITE, &oldProt))
+            return;
+
+        if (!Real_ProcessOpenDoor)
+            Real_ProcessOpenDoor = reinterpret_cast<ProcessOpenDoor_t>(vmt[slot]);
+
+        vmt[slot] = reinterpret_cast<uintptr_t>(&ProcessOpenDoor_Hook);
+
+        VirtualProtect(&vmt[slot], sizeof(uintptr_t), oldProt, &oldProt);
+    }
+
+    static void InstallProcessOpenDoorHooks()
+    {
+        PatchProcessOpenDoorSlot(reinterpret_cast<uintptr_t*>(0x871120)); // CAutomobile
+        PatchProcessOpenDoorSlot(reinterpret_cast<uintptr_t*>(0x871680)); // CHeli
+    }
+}
+
+class SlideDoorPlugin
+{
+public:
+    SlideDoorPlugin()
+    {
+        Events::initRwEvent += []
+            {
+                SlideDoor::InstallProcessOpenDoorHooks();
+            };
+
+        Events::vehicleSetModelEvent += [](CVehicle* vehicle, int)
+            {
+                SlideDoor::OnVehicleModelChanged(vehicle);
+            };
+
+        Events::vehicleRenderEvent.before += [](CVehicle* vehicle)
+            {
+                if (vehicle->m_nVehicleClass != VEHICLE_AUTOMOBILE &&
+                    vehicle->m_nVehicleClass != VEHICLE_HELI)
+                    return;
+                SlideDoor::Update(static_cast<CAutomobile*>(vehicle));
+            };
+
+        Events::processScriptsEvent += []
+            {
+                SlideDoor::UpdateAllHelis();
+            };
+
+        Events::vehicleDtorEvent.before += [](CVehicle* vehicle)
+            {
+                SlideDoor::OnVehicleDestroyed(vehicle);
+            };
+    }
+} slideDoorPlugin;
+
+// =============================================================================
+// 5. Belt & Chain
+// =============================================================================
+
+namespace BeltAndChain
+{
+    constexpr float DEFAULT_BELT_SPEED = 0.012f;
+    constexpr float GAS_BOOST = 0.020f;
+
+    // One belt/chain geometry of a model, with its original UVs.
+    struct Scroller
+    {
+        RpGeometry* geo = nullptr;
+        float mult = 1.0f;
+        bool chain = false;
+        std::vector<RwTexCoords> orig;
+    };
+
+    // Per-model state. Dropped when the last vehicle of the model is gone,
+    // which also drops the cached UVs and geometry pointers.
+    struct ModelState
+    {
+        int refs = 0;
+        bool scanned = false;
+        unsigned lastFrame = ~0u;
+        float constantOffset = 0.0f;
+        float gasOffset = 0.0f;
+        std::vector<Scroller> scrollers;
+    };
+
+    static std::unordered_map<int, ModelState> g_models;
+    static std::unordered_map<CVehicle*, int>  g_vehicleModel;
+
+    static float GetMultiplier(const char* name)
+    {
+        const char* mu = name ? strstr(name, "_mu=") : nullptr;
+        return mu ? static_cast<float>(atof(mu + 4)) : 1.0f;
+    }
+
+    static bool IsBelt(const char* name) { return name && _strnicmp(name, "f_belt", 6) == 0; }
+    static bool IsChain(const char* name) { return name && _strnicmp(name, "f_chain", 7) == 0; }
+
+    static const char* FindBeltOrChain(RwFrame* frame)
+    {
+        for (; frame; frame = RwFrameGetParent(frame))
+        {
+            const char* name = GetFrameNodeName(frame);
+            if (IsBelt(name) || IsChain(name))
+                return name;
+        }
+        return nullptr;
+    }
+
+    // Runs once per model (first rendered vehicle). Geometry is shared between
+    // clumps of the same model, so scanning one clump is enough.
+    static void ScanModel(ModelState& state, RpClump* clump)
+    {
+        state.scanned = true;
+
+        RpClumpForAllAtomics(clump, [](RpAtomic* atomic, void* data) -> RpAtomic* {
+            auto* st = static_cast<ModelState*>(data);
+            RpGeometry* geo = atomic ? atomic->geometry : nullptr;
+            if (!geo || !geo->texCoords[0])
+                return atomic;
+
+            const char* name = FindBeltOrChain(RpAtomicGetFrame(atomic));
+            if (!name)
+                return atomic;
+
+            for (const Scroller& e : st->scrollers)
+                if (e.geo == geo)
+                    return atomic;           // first atomic wins, as before
+
+            Scroller sc;
+            sc.geo = geo;
+            sc.mult = GetMultiplier(name);
+            sc.chain = IsChain(name);
+            sc.orig.assign(geo->texCoords[0], geo->texCoords[0] + geo->numVertices);
+            st->scrollers.push_back(std::move(sc));
+            return atomic;
+            }, &state);
+    }
+
+    static void ApplyScroll(const Scroller& sc, float offset)
+    {
+        RpGeometry* geo = sc.geo;
+        if (!geo || !geo->texCoords[0])
+            return;
+        if (static_cast<size_t>(geo->numVertices) != sc.orig.size())
+            return;                          // geometry changed under us: do nothing
+
+        const float wrapped = offset - floorf(offset);
+
+        RpGeometryLock(geo, rpGEOMETRYLOCKTEXCOORDS);
+        RwTexCoords* dst = geo->texCoords[0];
+        for (RwInt32 i = 0; i < geo->numVertices; ++i)
+        {
+            dst[i].u = sc.orig[i].u + wrapped;
+            dst[i].v = sc.orig[i].v;
+        }
+        RpGeometryUnlock(geo);
+    }
+
+    static void Unregister(CVehicle* v)
+    {
+        auto it = g_vehicleModel.find(v);
+        if (it == g_vehicleModel.end())
+            return;
+
+        auto m = g_models.find(it->second);
+        if (m != g_models.end() && --m->second.refs <= 0)
+            g_models.erase(m);
+
+        g_vehicleModel.erase(it);
+    }
+
+    static void Register(CVehicle* v, int modelId)
+    {
+        Unregister(v);                       // safe if set-model fires repeatedly
+        g_vehicleModel[v] = modelId;
+        g_models[modelId].refs++;
+    }
+
+    class Plugin
+    {
+    public:
+        Plugin()
+        {
+            Events::vehicleSetModelEvent += [](CVehicle* v, int modelId) {
+                Register(v, modelId);
+                };
+
+            Events::vehicleDtorEvent.before += [](CVehicle* v) {
+                Unregister(v);
+                };
+
+            Events::vehicleRenderEvent.before += [](CVehicle* vehicle) {
+                if (!vehicle || !vehicle->m_pRwClump || !vehicle->bEngineOn)
+                    return;
+
+                auto vm = g_vehicleModel.find(vehicle);
+                if (vm == g_vehicleModel.end()) {
+                    Register(vehicle, vehicle->m_nModelIndex);
+                    vm = g_vehicleModel.find(vehicle);
+                }
+
+                ModelState& s = g_models[vm->second];
+
+                if (!s.scanned)
+                    ScanModel(s, vehicle->m_pRwClump);
+                if (s.scrollers.empty())
+                    return;                  // normal cars exit here, no per-frame work
+
+                // Advance and write once per model per frame, regardless of how many
+                // times the render event fires (this is what keeps belt speed
+                // independent of camera angle).
+                const unsigned frame = CTimer::m_FrameCounter;
+                if (s.lastFrame == frame)
+                    return;
+                s.lastFrame = frame;
+
+                const float dt = CTimer::ms_fTimeStep;
+                s.constantOffset += dt * DEFAULT_BELT_SPEED;
+                s.gasOffset += dt * (DEFAULT_BELT_SPEED + fabsf(vehicle->m_fGasPedal) * GAS_BOOST);
+
+                for (const Scroller& sc : s.scrollers)
+                    ApplyScroll(sc, (sc.chain ? s.gasOffset : s.constantOffset) * sc.mult);
+                };
+        }
+    } gPlugin;
+}
